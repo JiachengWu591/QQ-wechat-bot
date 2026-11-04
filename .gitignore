@@ -1,0 +1,19 @@
+node_modules/
+dist/
+target/
+apps/desktop/src-tauri/gen/
+*.tsbuildinfo
+
+# Local dev data, including chat text
+.dev/
+
+# Credentials and login tokens never leave this machine
+.env
+.env.*
+!.env.example
+.secrets/
+
+# Spike captures can contain private chat content
+spikes/output/
+
+*.log
