@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { WECHAT_WORK_CHANNEL_ID, type EngineState, type PendingReply } from "@shu/protocol";
+import { WECHAT_WORK_CHANNEL_ID, workMessageProblem, type EngineState, type PendingReply } from "@shu/protocol";
 import { formatCost, formatTime, tierLabels } from "../ui.tsx";
 import type { EngineApi } from "../useEngine.ts";
 
@@ -10,10 +10,16 @@ function PendingCard({ reply, engine, state }: { reply: PendingReply; engine: En
   const { running, workbench } = state;
   const isWorkGroup = reply.channelId === WECHAT_WORK_CHANNEL_ID;
   const sending = isWorkGroup && Boolean(workbench?.sending);
-  const unfilled = isWorkGroup && /[【】]/.test(trimmed);
-  const multiline = isWorkGroup && /\n/.test(trimmed);
-  const blocked = isWorkGroup && !workbench?.enabled;
-  const approve = () => engine.send({ type: "pending.approve", pendingId: reply.id, ...(trimmed === reply.draft ? {} : { text: trimmed }) });
+  const switchedOff = isWorkGroup && (!running || !workbench?.enabled);
+  const problem = isWorkGroup ? workMessageProblem(trimmed) : null;
+  const uncertain = Boolean(reply.sendUncertain);
+  const approve = () =>
+    engine.send({
+      type: "pending.approve",
+      pendingId: reply.id,
+      ...(trimmed === reply.draft ? {} : { text: trimmed }),
+      ...(uncertain ? { confirmedUnsent: true } : {}),
+    });
 
   async function copy() {
     await navigator.clipboard.writeText(trimmed);
@@ -22,9 +28,8 @@ function PendingCard({ reply, engine, state }: { reply: PendingReply; engine: En
 
   function workGroupNote(): string {
     if (sending) return "正在发送，先不要碰键盘和鼠标。";
-    if (!running || blocked) return "总闸和微信工作群开关都打开后才能发送。";
-    if (unfilled) return "草稿里还有【】，填好才能发送。";
-    if (multiline) return "微信里换行等于发送，请改成一行。";
+    if (switchedOff) return "总闸和微信工作群开关都打开后才能发送。";
+    if (problem) return problem;
     return "发送时会短暂切到微信，你约 3 秒没操作后开始，发完切回来。发出去就收不回了。";
   }
 
@@ -40,14 +45,15 @@ function PendingCard({ reply, engine, state }: { reply: PendingReply; engine: En
         <span className="pending-sender">{reply.triggerSender}</span>
         {reply.triggerText}
       </blockquote>
+      {uncertain ? <p className="form-error">上一次发送不确定有没有发出去。请先看一下“{reply.conversationTitle}”里有没有这条，发出去了就点忽略。</p> : null}
       <label className="field-label" htmlFor={`draft-${reply.id}`}>
         回复草稿
       </label>
       <textarea id={`draft-${reply.id}`} rows={3} value={draft} onChange={(event) => setDraft(event.target.value)} />
       {isWorkGroup ? (
         <div className="actions">
-          <button type="button" className="button button-primary" disabled={!running || blocked || sending || unfilled || multiline || !trimmed} onClick={approve}>
-            发送到“{reply.conversationTitle}”
+          <button type="button" className="button button-primary" disabled={switchedOff || sending || problem !== null} onClick={approve}>
+            {uncertain ? "确认没发出去，再发一次" : `发送到“${reply.conversationTitle}”`}
           </button>
           <button type="button" className="button" disabled={!trimmed} onClick={() => void copy()}>
             {copied ? "已复制" : "复制草稿"}

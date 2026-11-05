@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { afterEach, describe, it } from "node:test";
-import { WECHAT_WORK_CHANNEL_ID } from "@shu/protocol";
+import { commandSchema, WECHAT_WORK_CHANNEL_ID } from "@shu/protocol";
 import { dayKey } from "../src/engine.ts";
 import { Store } from "../src/store.ts";
 import type { Adapter, AdapterHandlers, OutboundText } from "../src/types.ts";
@@ -452,14 +452,80 @@ describe("reading WeChat from the engine", () => {
           assert.ok(h.activity.some((entry) => entry.startsWith("error:") && entry.includes("不确定有没有发出去")));
         });
 
-        it("passes on a failure, keeps the draft and carries on", async () => {
+        it("won't send again after an uncertain send until the owner says it didn't go out", async () => {
+          const id = await drafted();
+          screen.sendAnswer = async () => ({ state: "uncertain", reason: "not-shown" });
+          await assert.rejects(h.engine.approve(id), /不确定/);
+          assert.equal(h.engine.getState().pending[0]!.sendUncertain, true);
+          assert.equal(h.engine.getState().pending[0]!.id, id, "it's still the same draft");
+
+          screen.sendAnswer = async () => ({ state: "sent" });
+          await assert.rejects(h.engine.approve(id), /请先看一下微信/);
+          await assert.rejects(h.engine.approve(id, "改过的"), /请先看一下微信/);
+          assert.equal(screen.sends.length, 1);
+
+          await h.engine.approve(id, undefined, true);
+          assert.equal(screen.sends.length, 2);
+          assert.deepEqual(h.engine.getState().pending, []);
+        });
+
+        it("keeps the text it tried, which is what the owner has to look for", async () => {
+          const id = await drafted("报告【时间】发你。");
+          screen.sendAnswer = async () => ({ state: "uncertain", reason: "not-shown" });
+          await assert.rejects(h.engine.approve(id, "报告周五发你。"), /不确定/);
+          assert.equal(h.engine.getState().pending[0]!.draft, "报告周五发你。");
+        });
+
+        it("still shows where it was in the list after an uncertain send", async () => {
+          const id = await drafted();
+          const createdAt = h.engine.getState().pending[0]!.createdAt;
+          screen.sendAnswer = async () => ({ state: "uncertain", reason: "not-shown" });
+          await assert.rejects(h.engine.approve(id), /不确定/);
+          assert.equal(h.engine.getState().pending[0]!.createdAt, createdAt);
+        });
+
+        it("doesn't count a refused send as uncertain, since Enter was never pressed", async () => {
+          const id = await drafted();
+          screen.sendAnswer = async () => ({ state: "refused", reason: "wrong-chat" });
+          await assert.rejects(h.engine.approve(id), /没有发送/);
+          assert.equal(h.engine.getState().pending[0]!.sendUncertain, undefined);
+          screen.sendAnswer = async () => ({ state: "sent" });
+          await h.engine.approve(id);
+          assert.deepEqual(h.engine.getState().pending, []);
+        });
+
+        it("stays uncertain if the next try is refused, since the first may still have gone out", async () => {
+          const id = await drafted();
+          screen.sendAnswer = async () => ({ state: "uncertain", reason: "not-shown" });
+          await assert.rejects(h.engine.approve(id), /不确定/);
+          screen.sendAnswer = async () => ({ state: "refused", reason: "wrong-chat" });
+          await assert.rejects(h.engine.approve(id, undefined, true), /没有发送/);
+          assert.equal(h.engine.getState().pending[0]!.sendUncertain, true);
+        });
+
+        it("counts a send that fell over as uncertain, since it could have been just after Enter", async () => {
           const id = await drafted();
           screen.sendAnswer = async () => {
             throw new Error("发送已中止。");
           };
           await assert.rejects(h.engine.approve(id), /发送已中止/);
-          assert.equal(h.engine.getState().pending.length, 1);
+          const pending = h.engine.getState().pending;
+          assert.equal(pending.length, 1);
+          assert.equal(pending[0]!.sendUncertain, true);
           assert.equal(h.engine.getState().workbench!.sending, false);
+          assert.ok(h.activity.some((entry) => entry.startsWith("error:") && entry.includes("不确定有没有发出去")));
+          await assert.rejects(h.engine.approve(id), /请先看一下微信/);
+        });
+
+        it("won't send a draft with an @", async () => {
+          const id = await drafted();
+          await assert.rejects(h.engine.approve(id, "收到 @小号"), /@/);
+          assert.deepEqual(screen.sends, []);
+        });
+
+        it("takes the owner's word through the console's command", () => {
+          const command = commandSchema.parse({ type: "pending.approve", pendingId: "a", confirmedUnsent: true });
+          assert.equal(command.type === "pending.approve" && command.confirmedUnsent, true);
         });
 
         it("sends one at a time, and shows that it's sending", async () => {

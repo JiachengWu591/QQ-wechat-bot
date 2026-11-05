@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { CHAT_READ_SYSTEM, chatReadPrompt, cleanDraft, draftProblem, mentionReminder, parseChatRead, readReminder, sendProblem } from "../src/wx-read.ts";
+import { workMessageProblem } from "@shu/protocol";
+import { CHAT_READ_SYSTEM, chatReadPrompt, cleanDraft, mentionReminder, parseChatRead, readReminder, sendProblem } from "../src/wx-read.ts";
 
 const answer = { messages: [{ sender: "小明", time: "09:30", text: "@主人 报告发一下", fromOwner: false }], mention: { sender: "小明", text: "@主人 报告发一下" }, summary: "小明在催报告。" };
 
@@ -42,6 +43,16 @@ describe("preparing a draft", () => {
     assert.equal(cleanDraft({ ...answer, draft: " \n " }), null);
   });
 
+  it("drops an @ the model opened with, since the reply is in the same group anyway", () => {
+    assert.equal(cleanDraft({ ...answer, draft: "@小号 收到，报告我看到了。" }), "收到，报告我看到了。");
+    assert.equal(cleanDraft({ ...answer, draft: "＠小号 ＠小明 收到" }), "收到");
+    assert.equal(cleanDraft({ ...answer, draft: "@小号" }), null);
+  });
+
+  it("leaves an @ further along for the owner to see, rather than changing what it says", () => {
+    assert.equal(cleanDraft({ ...answer, draft: "收到 @小号 看一下" }), "收到 @小号 看一下");
+  });
+
   it("reads a draft from the model's answer", () => {
     assert.equal(parseChatRead(JSON.stringify({ ...answer, draft: "收到" }))?.draft, "收到");
     assert.equal(parseChatRead(JSON.stringify({ ...answer, draft: null }))?.draft, null);
@@ -50,24 +61,31 @@ describe("preparing a draft", () => {
 
 describe("checking a draft before it's sent", () => {
   it("accepts an ordinary line", () => {
-    assert.equal(draftProblem("周五前发你。"), null);
+    assert.equal(workMessageProblem("周五前发你。"), null);
   });
 
   it("refuses anything left for the owner to fill in", () => {
-    assert.match(draftProblem("报告【时间】发你") as string, /【】/);
-    assert.match(draftProblem("只有一半【") as string, /【】/);
-    assert.match(draftProblem("只有一半】") as string, /【】/);
+    assert.match(workMessageProblem("报告【时间】发你") as string, /【】/);
+    assert.match(workMessageProblem("只有一半【") as string, /【】/);
+    assert.match(workMessageProblem("只有一半】") as string, /【】/);
   });
 
   it("refuses a line break, since that would send what's before it", () => {
-    assert.match(draftProblem("第一行\n第二行") as string, /换行/);
-    assert.match(draftProblem("第一行\r第二行") as string, /换行/);
+    assert.match(workMessageProblem("第一行\n第二行") as string, /换行/);
+    assert.match(workMessageProblem("第一行\r第二行") as string, /换行/);
+  });
+
+  it("refuses an @ anywhere, since typing one opens WeChat's member list", () => {
+    assert.match(workMessageProblem("@小号 收到") as string, /@/);
+    assert.match(workMessageProblem("收到 @小号") as string, /@/);
+    assert.match(workMessageProblem("收到＠小号") as string, /@/);
+    assert.match(workMessageProblem("发到 a@b.com") as string, /@/);
   });
 
   it("refuses nothing at all, and too much", () => {
-    assert.match(draftProblem("   ") as string, /空/);
-    assert.match(draftProblem("字".repeat(1001)) as string, /太长/);
-    assert.equal(draftProblem("字".repeat(1000)), null);
+    assert.match(workMessageProblem("   ") as string, /空/);
+    assert.match(workMessageProblem("字".repeat(1001)) as string, /太长/);
+    assert.equal(workMessageProblem("字".repeat(1000)), null);
   });
 });
 
@@ -107,6 +125,7 @@ describe("the prompt", () => {
     assert.match(prompt, /不要先说“好的”/);
     assert.match(prompt, /【】/);
     assert.match(prompt, /不要写猜的内容/);
+    assert.match(prompt, /不要写 @/);
   });
 
   it("names the group, and explains overlap only when there's more than one page", () => {

@@ -1,7 +1,7 @@
 // The hub: everything a message goes through between arriving and a reply leaving.
 import { EventEmitter } from "node:events";
 import { randomInt, randomUUID } from "node:crypto";
-import { modelOptions, WECHAT_WORK_CHANNEL_ID } from "@shu/protocol";
+import { modelOptions, WECHAT_WORK_CHANNEL_ID, workMessageProblem } from "@shu/protocol";
 import type {
   AccessEntry,
   ActivityEntry,
@@ -29,7 +29,7 @@ import type { LocalTool, ToolContext } from "./tools.ts";
 import type { Adapter, AdapterConversation, AdapterMessage } from "./types.ts";
 import { confusableGroup, normalizeGroupName, Workbench, type ChatReading, type WorkbenchMention } from "./workbench.ts";
 import type { Workspace } from "./workspace.ts";
-import { CHAT_READ_SYSTEM, chatReadPrompt, cleanDraft, draftProblem, mentionReminder, parseChatRead, readReminder, sendProblem, type ChatRead } from "./wx-read.ts";
+import { CHAT_READ_SYSTEM, chatReadPrompt, cleanDraft, mentionReminder, parseChatRead, readReminder, sendProblem, type ChatRead } from "./wx-read.ts";
 import type { WeChatScreen } from "./wx-screen.ts";
 
 export type EngineConfig = {
@@ -594,10 +594,10 @@ export class Engine extends EventEmitter<EngineEvents> {
     return received;
   }
 
-  async approve(pendingId: string, editedText?: string) {
+  async approve(pendingId: string, editedText?: string, confirmedUnsent?: boolean) {
     const reply = this.#store.listPending().find((entry) => entry.id === pendingId);
     if (!reply) throw new Error("这条待确认的回复已经不存在了。");
-    if (reply.channelId === WECHAT_WORK_CHANNEL_ID) return this.#sendWorkDraft(reply, editedText ?? reply.draft);
+    if (reply.channelId === WECHAT_WORK_CHANNEL_ID) return this.#sendWorkDraft(reply, editedText ?? reply.draft, confirmedUnsent === true);
     if (!this.#canSend(reply.channelId, reply.conversationId)) {
       throw new Error("总闸或这个聊天已关闭，打开后才能发送。");
     }
@@ -608,21 +608,31 @@ export class Engine extends EventEmitter<EngineEvents> {
   }
 
   // Only ever from the owner approving this draft in the console. Nothing here retries: a message
-  // that may have gone out can't be sent again without someone looking first.
-  async #sendWorkDraft(reply: PendingReply, text: string) {
+  // that may have gone out can't be sent again without the owner saying they've looked.
+  async #sendWorkDraft(reply: PendingReply, text: string, confirmedUnsent: boolean) {
     if (!this.#workbench || !this.#running || !this.#workbenchEnabled()) throw new Error("总闸或微信工作群开关已关闭，打开后才能发送。");
     const group = reply.conversationId;
     if (!this.#allowedGroups().includes(group)) throw new Error("这个群已经不在允许名单里了，没有发送。");
-    const problem = draftProblem(text);
+    const problem = workMessageProblem(text);
     if (problem) throw new Error(problem);
     if (this.#workbenchSending) throw new Error("正在发送另一条，等它结束再试。");
+    if (reply.sendUncertain && !confirmedUnsent) throw new Error("上一次不确定有没有发出去，请先看一下微信，确认没发出去再发。");
 
     this.#workbenchSending = true;
     this.#emitState();
     try {
-      const outcome = await this.#workbench.sendDraft(group, text);
+      let outcome;
+      try {
+        outcome = await this.#workbench.sendDraft(group, text);
+      } catch (error) {
+        // It was stopped or fell over part way, which could have been just after pressing Enter.
+        this.#markSendUncertain(reply, text);
+        this.#log("error", `发送没有完成，不确定有没有发出去：${error instanceof Error ? error.message : String(error)}`, group);
+        throw error;
+      }
       if (outcome.state !== "sent") {
         const message = sendProblem(outcome);
+        if (outcome.state === "uncertain") this.#markSendUncertain(reply, text);
         this.#log(outcome.state === "uncertain" ? "error" : "blocked", message, group);
         throw new Error(message);
       }
@@ -632,6 +642,12 @@ export class Engine extends EventEmitter<EngineEvents> {
       this.#workbenchSending = false;
       this.#emitState();
     }
+  }
+
+  // Keeps the text that was tried, since that's what the owner needs to look for in the chat.
+  #markSendUncertain(reply: PendingReply, text: string) {
+    this.#store.removePending(reply.id);
+    this.#store.addPending({ ...reply, draft: text, sendUncertain: true });
   }
 
   reject(pendingId: string) {

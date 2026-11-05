@@ -61,6 +61,16 @@ describe("local server", () => {
     client.socket.terminate();
   });
 
+  it("passes on the owner's word that an uncertain send didn't go out", async (t) => {
+    const approve = t.mock.method(h.engine, "approve", async () => {});
+    const client = connect(server.port, { origin: ORIGIN });
+    await client.opened;
+    client.socket.send(JSON.stringify({ type: "pending.approve", pendingId: "draft", text: "改过的", confirmedUnsent: true }));
+    await waitFor(() => approve.mock.callCount() === 1);
+    assert.deepEqual(approve.mock.calls[0]!.arguments, ["draft", "改过的", true]);
+    client.socket.terminate();
+  });
+
   it("passes login commands on to the channel, tidying the code", async () => {
     const calls: string[] = [];
     Object.defineProperties(h.adapter, {

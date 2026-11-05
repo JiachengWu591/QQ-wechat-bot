@@ -100,6 +100,22 @@ export type ChannelView = {
 // they'd go out through the WeChat window rather than a channel.
 export const WECHAT_WORK_CHANNEL_ID = "wechat-work";
 
+const MAX_WORK_MESSAGE_CHARS = 1000;
+
+// What's wrong with this text as something to type into a work group, as the owner would need it
+// put. Checked in the console, which shows it, and again in the engine.
+export function workMessageProblem(text: string): string | null {
+  if (!text.trim()) return "草稿是空的。";
+  if (/[【】]/.test(text)) return "草稿里还有【】，填好才能发送。";
+  if (/[\r\n]/.test(text)) return "微信里换行等于发送，请改成一行。";
+  // Typed character by character, an @ goes out as plain text: on real WeChat the person got no
+  // mention. It also opens the member list, where Enter might pick someone instead of sending, though
+  // that hasn't been tried with an @ at the end.
+  if (/[@＠]/.test(text)) return "草稿里有 @。这样发出去对方收不到 @ 提醒，请删掉，或者复制后自己发。";
+  if (text.length > MAX_WORK_MESSAGE_CHARS) return `草稿太长了，最多 ${MAX_WORK_MESSAGE_CHARS} 字。`;
+  return null;
+}
+
 export type PendingReply = {
   id: string;
   channelId: string;
@@ -112,6 +128,8 @@ export type PendingReply = {
   tier: Tier;
   costUsd: number;
   createdAt: number;
+  // A try to send this may have gone out, so sending again takes the owner saying it didn't.
+  sendUncertain?: boolean;
 };
 
 export type SimSender = { id: string; name: string; tier: Tier };
@@ -186,7 +204,7 @@ export const commandSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("conversation.setEnabled"), channelId: id, conversationId: id, enabled: z.boolean() }),
   z.object({ type: z.literal("conversation.setAutonomy"), channelId: id, conversationId: id, autonomy: z.enum(autonomyLevels) }),
   z.object({ type: z.literal("conversation.rename"), channelId: id, conversationId: id, title: z.string().trim().min(1).max(60) }),
-  z.object({ type: z.literal("pending.approve"), pendingId: id, text: z.string().min(1).max(10000).optional() }),
+  z.object({ type: z.literal("pending.approve"), pendingId: id, text: z.string().min(1).max(10000).optional(), confirmedUnsent: z.boolean().optional() }),
   z.object({ type: z.literal("pending.reject"), pendingId: id }),
   z.object({ type: z.literal("pairing.start"), channelId: id, tier: z.enum(grantedTiers) }),
   z.object({ type: z.literal("pairing.cancel") }),
