@@ -186,21 +186,24 @@ export class QqAdapter implements Adapter {
   async #connect() {
     if (this.#stopped) return;
     this.#setStatus({ state: "connecting" });
-    let url: string;
+    let ws: WebSocket;
     try {
       await this.#ensureToken();
       const gateway = (await this.#request("GET", "/gateway/bot")) as { url?: string };
       if (!gateway.url) throw new Error("没有拿到网关地址");
-      url = gateway.url;
+      if (this.#stopped) return;
+      ws = new WebSocket(gateway.url);
     } catch (error) {
       return this.#scheduleReconnect(describeNetworkError(error, "QQ"));
     }
-    if (this.#stopped) return;
 
-    const ws = new WebSocket(url);
     this.#ws = ws;
     ws.addEventListener("message", (event) => {
-      if (ws === this.#ws) void this.#onFrame(ws, JSON.parse(String(event.data)) as GatewayFrame);
+      if (ws !== this.#ws) return;
+      // Nothing else is waiting on this, and a rejection nobody catches would end the whole engine.
+      this.#onFrame(ws, String(event.data)).catch((error: unknown) => {
+        if (ws === this.#ws) this.#dropAndReconnect(describeNetworkError(error, "QQ"));
+      });
     });
     ws.addEventListener("close", (event) => {
       if (ws !== this.#ws) return;
@@ -210,7 +213,8 @@ export class QqAdapter implements Adapter {
     ws.addEventListener("error", () => {});
   }
 
-  async #onFrame(ws: WebSocket, frame: GatewayFrame) {
+  async #onFrame(ws: WebSocket, raw: string) {
+    const frame = JSON.parse(raw) as GatewayFrame;
     if (typeof frame.s === "number") this.#lastSeq = frame.s;
     switch (frame.op) {
       case Op.Hello: {

@@ -27,6 +27,11 @@ class FakeQq {
   heartbeatIntervalMs = 40;
   sendFailure: { status: number; body: unknown } | null = null;
   rejectTokenOnce = false;
+  tokenExpiresIn = "7200";
+  // What happens to particular token requests, by number, counting from 1.
+  tokenPlan = new Map<number, "drop" | "hold">();
+  dropHeldTokenRequest: (() => void) | null = null;
+  badGatewayUrlOnce = false;
   // What happens to each coming send, in order. Once these run out, sends work normally.
   sendPlan: Array<"drop" | "arrive-then-drop" | { status: number; body: unknown }> = [];
   sendAttempts = 0;
@@ -44,9 +49,21 @@ class FakeQq {
         };
         if (req.url === "/app/getAppAccessToken") {
           this.tokenRequests++;
-          return respond(200, { access_token: `token-${this.tokenRequests}`, expires_in: "7200" });
+          const step = this.tokenPlan.get(this.tokenRequests);
+          if (step === "drop") return req.socket.destroy();
+          if (step === "hold") {
+            this.dropHeldTokenRequest = () => req.socket.destroy();
+            return;
+          }
+          return respond(200, { access_token: `token-${this.tokenRequests}`, expires_in: this.tokenExpiresIn });
         }
-        if (req.url === "/gateway/bot") return respond(200, { url: `ws://127.0.0.1:${this.port}/ws` });
+        if (req.url === "/gateway/bot") {
+          if (this.badGatewayUrlOnce) {
+            this.badGatewayUrlOnce = false;
+            return respond(200, { url: "not a url" });
+          }
+          return respond(200, { url: `ws://127.0.0.1:${this.port}/ws` });
+        }
         if (this.rejectTokenOnce) {
           this.rejectTokenOnce = false;
           return respond(401, { code: 11244, message: "token expired" });
@@ -382,8 +399,85 @@ describe("QQ adapter", () => {
     await fake.listen();
   });
 
+  // A failure here that nothing catches would end the whole engine, and it restarts switched off.
+  describe("when handling the gateway fails", () => {
+    async function startWith(prepare: (fake: FakeQq) => void) {
+      fake = new FakeQq();
+      await fake.listen();
+      prepare(fake);
+      statuses.length = 0;
+      adapter = new QqAdapter({ appId: "app", appSecret: "secret", apiBase: `http://127.0.0.1:${fake.port}`, backoffMs: 5 });
+      await adapter.start({ onMessage: (message) => messages.push(message), onStatus: (status) => statuses.push(status) });
+    }
+    const connected = () => statuses.at(-1)?.state === "connected";
+
+    // A token this close to expiring is fetched again every time it's used: once to connect,
+    // once for the gateway address, and the third time in answer to the gateway's hello.
+    const tokenRequestAtHello = 3;
+
+    it("reconnects when the token can't be refreshed during the handshake", async () => {
+      await startWith((qq) => {
+        qq.tokenExpiresIn = "60";
+        qq.tokenPlan.set(tokenRequestAtHello, "drop");
+      });
+      await until(connected, "connected on the next try");
+      assert.equal(fake.connections, 2);
+      assert.ok(statuses.some((status) => status.detail === "网络错误（UND_ERR_SOCKET），正在重连"));
+    });
+
+    it("leaves the new connection alone when the old one's token request fails late", async () => {
+      await startWith((qq) => {
+        qq.tokenExpiresIn = "60";
+        qq.tokenPlan.set(tokenRequestAtHello, "hold");
+      });
+      await until(() => fake.dropHeldTokenRequest !== null, "the handshake to be waiting on a token");
+      fake.socket.terminate();
+      await until(connected, "connected on the next try");
+
+      fake.dropHeldTokenRequest!();
+      await new Promise((resolve) => setTimeout(resolve, 60));
+      assert.equal(fake.connections, 2);
+      assert.ok(connected());
+    });
+
+    it("reconnects after a frame it can't read", async () => {
+      await connect();
+      fake.socket.send("not json");
+      await until(() => fake.connections === 2, "a new connection");
+      await until(() => fake.framesWithOp(6).length === 1, "resume");
+    });
+
+    it("reconnects after an event it can't process, and doesn't see that event again", async () => {
+      await connect();
+      fake.dispatch("GROUP_MESSAGE_CREATE", null);
+      await until(() => fake.framesWithOp(6).length === 1, "resume");
+      assert.equal(fake.framesWithOp(6)[0]!.d.seq, 2, "past the bad event, which was number 2 after READY");
+      await until(connected, "connected again");
+      fake.dispatch("GROUP_MESSAGE_CREATE", groupEvent({ id: "after" }));
+      await until(() => messages.some((message) => message.id === "after"), "the next message");
+    });
+
+    it("ignores what arrives on a connection it has already dropped", async () => {
+      await connect();
+      fake.socket.send(JSON.stringify({ op: 7 }));
+      fake.dispatch("GROUP_MESSAGE_CREATE", groupEvent({ id: "late" }));
+      await until(() => fake.framesWithOp(6).length === 1, "resume");
+      await until(connected, "connected again");
+      assert.deepEqual(messages, []);
+    });
+
+    it("tries again when the gateway address is unusable", async () => {
+      await startWith((qq) => {
+        qq.badGatewayUrlOnce = true;
+      });
+      await until(connected, "connected on the next try");
+      assert.equal(fake.connections, 1);
+      assert.ok(statuses.some((status) => status.detail?.endsWith("正在重连")));
+    });
+  });
+
   describe("when a send fails", () => {
-    const ordinary = (text = "你好") => adapter.send({ channelId: "qq", conversationId: GROUP, conversationKind: "group", text });
+    const ordinary =(text = "你好") => adapter.send({ channelId: "qq", conversationId: GROUP, conversationKind: "group", text });
     const reply = (text = "你好") => adapter.send({ channelId: "qq", conversationId: GROUP, conversationKind: "group", text, replyToId: "m1" });
 
     async function connectWithMessageToReplyTo(backoffMs?: number) {
