@@ -4,7 +4,10 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 const DEFAULT_SCRIPT = fileURLToPath(new URL("./wx-helper.ps1", import.meta.url));
+const DEFAULT_SENDER = fileURLToPath(new URL("./wx-send.ps1", import.meta.url));
 const REQUEST_TIMEOUT_MS = 30_000;
+// It waits up to 30 seconds for the owner to stop typing, then has to type the whole reply.
+const SEND_TIMEOUT_MS = 120_000;
 const MAX_STDERR_CHARS = 300;
 
 export type ScreenMention = { y: number; names: string[] };
@@ -20,12 +23,18 @@ export type ChatPage = { image: Buffer; titles: string[] };
 
 export type ChatCapture = Unavailable | { state: "ok"; pages: ChatPage[]; reachedTop: boolean; interrupted: boolean };
 
+// Refused means Enter was never pressed. Uncertain means it was, and whether the message went out
+// couldn't be confirmed, so it must not simply be tried again.
+export type SendOutcome = { state: "sent" } | { state: "refused" | "uncertain"; reason: string };
+
 export interface WeChatScreen {
   scan(): Promise<ScreenScan>;
   // Opens the session list's row at this height. Opening a chat marks it as read.
   openRow(y: number): Promise<OpenedRow>;
   // The open chat, oldest page first.
   captureChat(options: { pages: number; postsPerPage: number }): Promise<ChatCapture>;
+  // Types into that group's chat and sends. Takes the foreground for as long as that takes.
+  sendText(group: string, text: string): Promise<SendOutcome>;
   stop(): Promise<void>;
 }
 
@@ -33,22 +42,92 @@ type Waiting = { resolve(reply: any): void; reject(error: Error): void; timer: R
 
 const HELPER_ERRORS: Record<string, string> = { "no-chinese-ocr": "这台电脑没有装中文 OCR 语言包。" };
 
-// It reads a screen, so it has no use for the API key and platform secrets in the engine's own
-// environment.
+// These scripts work with a screen, so they have no use for the API key and platform secrets in the
+// engine's own environment.
 function withoutSecrets(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   return Object.fromEntries(Object.entries(env).filter(([key]) => !key.toUpperCase().startsWith("SHU_")));
 }
 
+function launch(script: string): ChildProcessWithoutNullStreams {
+  return spawn("powershell.exe", ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", script], {
+    windowsHide: true,
+    env: withoutSecrets(process.env),
+  });
+}
+
+// PowerShell reads stdin in the console's code page, which would garble a chat's name.
+function asciiJson(value: unknown): string {
+  return JSON.stringify(value).replace(/[^\x00-\x7F]/g, (character) => `\\u${character.charCodeAt(0).toString(16).padStart(4, "0")}`);
+}
+
 export class WxHelperScreen implements WeChatScreen {
   #script: string;
+  #senderScript: string;
   #timeoutMs: number;
+  #sendTimeoutMs: number;
   #child: ChildProcessWithoutNullStreams | null = null;
+  #sender: ChildProcessWithoutNullStreams | null = null;
   #waiting = new Map<number, Waiting>();
   #nextId = 0;
 
-  constructor(options: { script?: string; timeoutMs?: number } = {}) {
+  constructor(options: { script?: string; senderScript?: string; timeoutMs?: number; sendTimeoutMs?: number } = {}) {
     this.#script = options.script ?? DEFAULT_SCRIPT;
+    this.#senderScript = options.senderScript ?? DEFAULT_SENDER;
     this.#timeoutMs = options.timeoutMs ?? REQUEST_TIMEOUT_MS;
+    this.#sendTimeoutMs = options.sendTimeoutMs ?? SEND_TIMEOUT_MS;
+  }
+
+  sendText(group: string, text: string): Promise<SendOutcome> {
+    return this.#runSender({ command: "send", group, text });
+  }
+
+  // Everything up to pressing Enter, then it clears what it typed. For trying the sender out against
+  // a real WeChat window. Nothing in the engine calls this.
+  rehearseSend(group: string, text: string): Promise<SendOutcome> {
+    return this.#runSender({ command: "send", group, text, rehearse: true });
+  }
+
+  selfTestSend(): Promise<Record<string, unknown>> {
+    return this.#runSender({ command: "selftest" });
+  }
+
+  // A process of its own, started for this request and gone afterwards. Ending it is how a send is
+  // stopped: if it hasn't pressed Enter by then, it never will.
+  #runSender<T>(request: Record<string, string | boolean>): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      const child = launch(this.#senderScript);
+      this.#sender = child;
+      let stdout = "";
+      let stderr = "";
+      let failure: Error | null = null;
+      const timer = setTimeout(() => {
+        failure = new Error("发送超时，已经停下。输入框里可能留有没发完的文字。");
+        child.kill();
+      }, this.#sendTimeoutMs);
+
+      child.stdout.setEncoding("utf8");
+      child.stdout.on("data", (chunk: string) => (stdout += chunk));
+      child.stderr.setEncoding("utf8");
+      child.stderr.on("data", (chunk: string) => (stderr = (stderr + chunk).slice(-MAX_STDERR_CHARS)));
+      child.stdin.on("error", () => {});
+      child.on("error", (error) => {
+        failure = new Error(`无法启动发送程序：${error.message}`);
+      });
+      child.on("close", (code) => {
+        clearTimeout(timer);
+        if (this.#sender === child) this.#sender = null;
+        if (child.killed && !failure) failure = new Error("发送已中止。输入框里可能留有没发完的文字。");
+        if (failure) return reject(failure);
+        try {
+          const reply = JSON.parse(stdout.trim().split(/\r?\n/).at(-1) ?? "") as { error?: string };
+          if (reply.error !== undefined) return reject(new Error(`发送出错：${reply.error}`));
+          resolve(reply as T);
+        } catch {
+          reject(new Error(`发送程序退出了（${code}）${stderr ? `：${stderr.trim()}` : ""}`));
+        }
+      });
+      child.stdin.write(`${asciiJson(request)}\n`);
+    });
   }
 
   scan(): Promise<ScreenScan> {
@@ -81,6 +160,7 @@ export class WxHelperScreen implements WeChatScreen {
   }
 
   async stop() {
+    this.#sender?.kill();
     this.#end(new Error("已停止读取微信窗口。"));
   }
 
@@ -97,10 +177,7 @@ export class WxHelperScreen implements WeChatScreen {
   }
 
   #launch(): ChildProcessWithoutNullStreams {
-    const child = spawn("powershell.exe", ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", this.#script], {
-      windowsHide: true,
-      env: withoutSecrets(process.env),
-    });
+    const child = launch(this.#script);
     this.#child = child;
 
     let buffered = "";

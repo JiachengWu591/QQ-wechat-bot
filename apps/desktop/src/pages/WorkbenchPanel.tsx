@@ -46,7 +46,7 @@ export function WorkbenchPanel({ engine, state }: { engine: EngineApi; state: En
       </header>
 
       <p className="panel-meta">
-        每 {intervalSeconds} 秒看一次微信窗口的左栏，找“有人@我”，然后提醒你。左栏只在这台电脑上识别，不发给 Claude。这一版不会往群里发消息。微信不能最小化，盖在别的窗口后面没关系。
+        每 {intervalSeconds} 秒看一次微信窗口的左栏，找“有人@我”，然后提醒你。左栏只在这台电脑上识别，不发给 Claude。不会自动往群里发消息，只有你在“待确认”里点了发送才会发。微信不能最小化，盖在别的窗口后面没关系。
       </p>
       {enabled && !running ? <p className="panel-meta">打开总闸后开始读取。</p> : null}
       {status.detail ? <p className={status.state === "error" ? "form-error" : "panel-meta"}>{status.detail}</p> : null}

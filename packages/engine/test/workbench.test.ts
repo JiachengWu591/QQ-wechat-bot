@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { afterEach, describe, it } from "node:test";
 import type { WorkbenchStatus } from "@shu/protocol";
 import { confusableGroup, editDistance, identifyGroup, normalizeGroupName, titleMatches, Workbench, type ChatReading, type WorkbenchMention } from "../src/workbench.ts";
-import type { ChatCapture, OpenedRow, ScreenScan, WeChatScreen } from "../src/wx-screen.ts";
+import type { ChatCapture, OpenedRow, ScreenScan, SendOutcome, WeChatScreen } from "../src/wx-screen.ts";
 
 // Scripted answers, one per scan. Once they run out it keeps repeating the last one.
 class FakeScreen implements WeChatScreen {
@@ -32,6 +32,14 @@ class FakeScreen implements WeChatScreen {
     this.captures++;
     if (this.captureAnswer instanceof Error) throw this.captureAnswer;
     return this.captureAnswer;
+  }
+
+  sends: string[] = [];
+  sendAnswer: SendOutcome | Promise<SendOutcome> = { state: "sent" };
+
+  async sendText(group: string, text: string): Promise<SendOutcome> {
+    this.sends.push(`${group}: ${text}`);
+    return this.sendAnswer;
   }
 
   async stop() {
@@ -530,6 +538,63 @@ describe("watching for mentions", () => {
       finish({ state: "ok", pages: [page("项目周会群")], reachedTop: false, interrupted: false });
       await new Promise((resolve) => setTimeout(resolve, 10));
       assert.deepEqual(reads, []);
+    });
+
+    describe("while sending", () => {
+      it("passes the send on and gives back the answer", async () => {
+        start(nothing);
+        screen.sendAnswer = { state: "refused", reason: "wrong-chat" };
+        assert.deepEqual(await workbench.sendDraft("项目周会群", "收到"), { state: "refused", reason: "wrong-chat" });
+        assert.deepEqual(screen.sends, ["项目周会群: 收到"]);
+      });
+
+      it("opens nothing, since both would be working in the same window", async () => {
+        allowed = allowedGroup;
+        start(nothing);
+        await until(() => screen.scans > 0, "first scan");
+        let finish!: (outcome: SendOutcome) => void;
+        screen.sendAnswer = new Promise<SendOutcome>((resolve) => (finish = resolve));
+        const sending = workbench.sendDraft("财务报销群", "收到");
+        await until(() => screen.sends.length === 1, "sending");
+
+        screen.plan = [seen(["项目周会群"])];
+        const before = screen.scans;
+        await until(() => screen.scans > before + 5, "scans during the send");
+        assert.deepEqual(screen.opened, []);
+
+        finish({ state: "sent" });
+        await sending;
+        await until(() => screen.opened.length === 1, "the read it was holding back");
+      });
+
+      it("waits for a read that's under way, even one still with the model", async () => {
+        allowed = allowedGroup;
+        start(nothing, seen(["项目周会群"]));
+        let release!: () => void;
+        let reading = false;
+        onRead = async () => {
+          reading = true;
+          await new Promise<void>((resolve) => (release = resolve));
+        };
+        await until(() => reading, "a read under way");
+        const sending = workbench.sendDraft("财务报销群", "收到");
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        assert.deepEqual(screen.sends, [], "not until the read is done");
+        release();
+        await sending;
+        assert.equal(screen.sends.length, 1);
+      });
+
+      it("goes back to reading after a send that failed", async () => {
+        allowed = allowedGroup;
+        start(nothing);
+        await until(() => screen.scans > 0, "first scan");
+        screen.sendAnswer = Promise.reject(new Error("中止")) as Promise<SendOutcome>;
+        (screen.sendAnswer as Promise<SendOutcome>).catch(() => {});
+        await assert.rejects(workbench.sendDraft("财务报销群", "收到"), /中止/);
+        screen.plan = [seen(["项目周会群"])];
+        await until(() => screen.opened.length === 1, "a read");
+      });
     });
 
     it("forgets what was waiting when turned off", async () => {

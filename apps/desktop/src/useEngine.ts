@@ -59,8 +59,11 @@ export function useEngine(): EngineApi {
   }, []);
 
   const send = useCallback((command: Command) => {
-    if (socket.current?.readyState === WebSocket.OPEN) socket.current.send(JSON.stringify(command));
-    else setError("还没有连接到引擎。");
+    // Whatever went wrong before, this is a new attempt. An old error left up would read as its result.
+    if (socket.current?.readyState === WebSocket.OPEN) {
+      setError(null);
+      socket.current.send(JSON.stringify(command));
+    } else setError("还没有连接到引擎。");
   }, []);
 
   return { connected, state, activity, chat, error, showError: setError, dismissError: () => setError(null), send };

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { CHAT_READ_SYSTEM, chatReadPrompt, cleanDraft, mentionReminder, parseChatRead, readReminder } from "../src/wx-read.ts";
+import { CHAT_READ_SYSTEM, chatReadPrompt, cleanDraft, draftProblem, mentionReminder, parseChatRead, readReminder, sendProblem } from "../src/wx-read.ts";
 
 const answer = { messages: [{ sender: "小明", time: "09:30", text: "@主人 报告发一下", fromOwner: false }], mention: { sender: "小明", text: "@主人 报告发一下" }, summary: "小明在催报告。" };
 
@@ -45,6 +45,48 @@ describe("preparing a draft", () => {
   it("reads a draft from the model's answer", () => {
     assert.equal(parseChatRead(JSON.stringify({ ...answer, draft: "收到" }))?.draft, "收到");
     assert.equal(parseChatRead(JSON.stringify({ ...answer, draft: null }))?.draft, null);
+  });
+});
+
+describe("checking a draft before it's sent", () => {
+  it("accepts an ordinary line", () => {
+    assert.equal(draftProblem("周五前发你。"), null);
+  });
+
+  it("refuses anything left for the owner to fill in", () => {
+    assert.match(draftProblem("报告【时间】发你") as string, /【】/);
+    assert.match(draftProblem("只有一半【") as string, /【】/);
+    assert.match(draftProblem("只有一半】") as string, /【】/);
+  });
+
+  it("refuses a line break, since that would send what's before it", () => {
+    assert.match(draftProblem("第一行\n第二行") as string, /换行/);
+    assert.match(draftProblem("第一行\r第二行") as string, /换行/);
+  });
+
+  it("refuses nothing at all, and too much", () => {
+    assert.match(draftProblem("   ") as string, /空/);
+    assert.match(draftProblem("字".repeat(1001)) as string, /太长/);
+    assert.equal(draftProblem("字".repeat(1000)), null);
+  });
+});
+
+describe("explaining why a send stopped", () => {
+  it("says a refused send didn't go out", () => {
+    for (const reason of ["bad-text", "owner-busy", "missing", "lost-focus", "input-rejected", "search-failed", "not-top-result", "wrong-chat", "no-input-box", "input-not-empty", "not-typed", "typed-mismatch"]) {
+      assert.match(sendProblem({ state: "refused", reason }), /没有发送/, reason);
+    }
+  });
+
+  it("still says so for a reason it doesn't know", () => {
+    assert.match(sendProblem({ state: "refused", reason: "something-new" }), /没有发送（something-new）/);
+  });
+
+  it("says an uncertain send may have gone out, so the owner looks before trying again", () => {
+    for (const reason of ["no-capture", "still-in-input", "not-shown", "something-new"]) {
+      assert.match(sendProblem({ state: "uncertain", reason }), /不确定有没有发出去.*确认没发出去再重试/, reason);
+    }
+    assert.match(sendProblem({ state: "uncertain", reason: "still-in-input" }), /还在输入框/);
   });
 });
 
@@ -101,7 +143,7 @@ describe("what the owner is told", () => {
   it("includes the draft, and says where to deal with it", () => {
     assert.equal(
       readReminder("甲", { ...answer, mention: null, summary: "", draft: "好的，【时间】发你。" }),
-      "“甲”里有人 @ 你。\n草稿：好的，【时间】发你。\n可以到控制台的“待确认”里修改或忽略。",
+      "“甲”里有人 @ 你。\n草稿：好的，【时间】发你。\n要发送的话，到控制台的“待确认”里确认。",
     );
   });
 

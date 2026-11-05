@@ -29,7 +29,7 @@ import type { LocalTool, ToolContext } from "./tools.ts";
 import type { Adapter, AdapterConversation, AdapterMessage } from "./types.ts";
 import { confusableGroup, normalizeGroupName, Workbench, type ChatReading, type WorkbenchMention } from "./workbench.ts";
 import type { Workspace } from "./workspace.ts";
-import { CHAT_READ_SYSTEM, chatReadPrompt, cleanDraft, mentionReminder, parseChatRead, readReminder, type ChatRead } from "./wx-read.ts";
+import { CHAT_READ_SYSTEM, chatReadPrompt, cleanDraft, draftProblem, mentionReminder, parseChatRead, readReminder, sendProblem, type ChatRead } from "./wx-read.ts";
 import type { WeChatScreen } from "./wx-screen.ts";
 
 export type EngineConfig = {
@@ -121,6 +121,7 @@ export class Engine extends EventEmitter<EngineEvents> {
   #workbench: Workbench | null = null;
   #workbenchStatus: WorkbenchStatus = { state: "off" };
   #workbenchIntervalMs = 0;
+  #workbenchSending = false;
 
   constructor(deps: {
     store: Store;
@@ -243,6 +244,7 @@ export class Engine extends EventEmitter<EngineEvents> {
       status: this.#workbenchStatus,
       allowedGroups: this.#allowedGroups(),
       intervalSeconds: Math.round(this.#workbenchIntervalMs / 1000),
+      sending: this.#workbenchSending,
     };
   }
 
@@ -595,7 +597,7 @@ export class Engine extends EventEmitter<EngineEvents> {
   async approve(pendingId: string, editedText?: string) {
     const reply = this.#store.listPending().find((entry) => entry.id === pendingId);
     if (!reply) throw new Error("这条待确认的回复已经不存在了。");
-    if (reply.channelId === WECHAT_WORK_CHANNEL_ID) throw new Error("这一版还不能往工作群发送，可以复制草稿自己发。");
+    if (reply.channelId === WECHAT_WORK_CHANNEL_ID) return this.#sendWorkDraft(reply, editedText ?? reply.draft);
     if (!this.#canSend(reply.channelId, reply.conversationId)) {
       throw new Error("总闸或这个聊天已关闭，打开后才能发送。");
     }
@@ -603,6 +605,33 @@ export class Engine extends EventEmitter<EngineEvents> {
     await this.#deliver(this.#conversationFor(reply.channelId, reply.conversationId), reply.channelId, editedText ?? reply.draft, reply.tier, reply.replyToId);
     this.#store.removePending(reply.id);
     this.#emitState();
+  }
+
+  // Only ever from the owner approving this draft in the console. Nothing here retries: a message
+  // that may have gone out can't be sent again without someone looking first.
+  async #sendWorkDraft(reply: PendingReply, text: string) {
+    if (!this.#workbench || !this.#running || !this.#workbenchEnabled()) throw new Error("总闸或微信工作群开关已关闭，打开后才能发送。");
+    const group = reply.conversationId;
+    if (!this.#allowedGroups().includes(group)) throw new Error("这个群已经不在允许名单里了，没有发送。");
+    const problem = draftProblem(text);
+    if (problem) throw new Error(problem);
+    if (this.#workbenchSending) throw new Error("正在发送另一条，等它结束再试。");
+
+    this.#workbenchSending = true;
+    this.#emitState();
+    try {
+      const outcome = await this.#workbench.sendDraft(group, text);
+      if (outcome.state !== "sent") {
+        const message = sendProblem(outcome);
+        this.#log(outcome.state === "uncertain" ? "error" : "blocked", message, group);
+        throw new Error(message);
+      }
+      this.#store.removePending(reply.id);
+      this.#log("ok", `已发到群里：${preview(text)}`, group);
+    } finally {
+      this.#workbenchSending = false;
+      this.#emitState();
+    }
   }
 
   reject(pendingId: string) {

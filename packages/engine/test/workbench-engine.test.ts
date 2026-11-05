@@ -4,7 +4,7 @@ import { WECHAT_WORK_CHANNEL_ID } from "@shu/protocol";
 import { dayKey } from "../src/engine.ts";
 import { Store } from "../src/store.ts";
 import type { Adapter, AdapterHandlers, OutboundText } from "../src/types.ts";
-import type { ChatCapture, OpenedRow, ScreenScan, WeChatScreen } from "../src/wx-screen.ts";
+import type { ChatCapture, OpenedRow, ScreenScan, SendOutcome, WeChatScreen } from "../src/wx-screen.ts";
 import { harness, type Harness } from "./helpers.ts";
 
 class FakeScreen implements WeChatScreen {
@@ -26,6 +26,14 @@ class FakeScreen implements WeChatScreen {
 
   async captureChat(): Promise<ChatCapture> {
     return { state: "ok", pages: [{ image: Buffer.from("older"), titles: [this.title] }, { image: Buffer.from("newer"), titles: [this.title] }], reachedTop: false, interrupted: false };
+  }
+
+  sends: { group: string; text: string }[] = [];
+  sendAnswer: () => Promise<SendOutcome> = async () => ({ state: "sent" });
+
+  async sendText(group: string, text: string) {
+    this.sends.push({ group, text });
+    return this.sendAnswer();
   }
 
   async stop() {
@@ -88,7 +96,7 @@ describe("reading WeChat from the engine", () => {
     await h.engine.start();
     await new Promise((resolve) => setTimeout(resolve, 10));
     assert.equal(screen.scans, 0);
-    assert.deepEqual(h.engine.getState().workbench, { enabled: false, status: { state: "off" }, allowedGroups: [], intervalSeconds: 0 });
+    assert.deepEqual(h.engine.getState().workbench, { enabled: false, status: { state: "off" }, allowedGroups: [], intervalSeconds: 0, sending: false });
   });
 
   it("isn't offered where the screen can't be read", async () => {
@@ -360,15 +368,132 @@ describe("reading WeChat from the engine", () => {
         assert.equal(h.store.recentChat(50).some((line) => line.text.includes("这句草稿")), false);
       });
 
-      it("can't be sent yet, and stays there when someone tries", async () => {
-        await mentioned();
-        h.fake.readBehavior = answer("好的");
-        await until(() => owned.sent.length === 1, "reminder");
-        const { id } = h.engine.getState().pending[0]!;
-        await assert.rejects(h.engine.approve(id), /还不能往工作群发送/);
-        await assert.rejects(h.engine.approve(id, "改过的"), /还不能往工作群发送/);
-        assert.equal(h.engine.getState().pending.length, 1);
-        assert.equal(owned.sent.length, 1);
+      describe("once approved", () => {
+        async function drafted(draft = "周五前发你。") {
+          await mentioned();
+          h.fake.readBehavior = answer(draft);
+          await until(() => owned.sent.length === 1, "reminder");
+          return h.engine.getState().pending[0]!.id;
+        }
+
+        it("sends it to that group, then takes it off the list and logs it", async () => {
+          const id = await drafted();
+          await h.engine.approve(id);
+          assert.deepEqual(screen.sends, [{ group: "财务报销群", text: "周五前发你。" }]);
+          assert.deepEqual(h.engine.getState().pending, []);
+          assert.ok(h.activity.includes("ok: 已发到群里：周五前发你。"));
+        });
+
+        it("sends what the owner edited it to", async () => {
+          const id = await drafted("报告【时间】发你。");
+          await h.engine.approve(id, "报告周五发你。");
+          assert.deepEqual(screen.sends, [{ group: "财务报销群", text: "报告周五发你。" }]);
+        });
+
+        it("doesn't send anything by itself", async () => {
+          await drafted();
+          const before = screen.scans;
+          await until(() => screen.scans > before + 5, "scans");
+          assert.deepEqual(screen.sends, []);
+        });
+
+        it("keeps what was sent out of every chat history", async () => {
+          const id = await drafted();
+          await h.engine.approve(id);
+          assert.equal(h.store.recentChat(50).some((line) => line.text.includes("周五前发你")), false);
+        });
+
+        it("won't send a draft with something left to fill in, or a line break", async () => {
+          const id = await drafted("报告【时间】发你。");
+          await assert.rejects(h.engine.approve(id), /【】/);
+          await assert.rejects(h.engine.approve(id, "第一行\n第二行"), /换行/);
+          await assert.rejects(h.engine.approve(id, "   "), /空/);
+          assert.deepEqual(screen.sends, []);
+          assert.equal(h.engine.getState().pending.length, 1);
+        });
+
+        it("won't send with the master switch off, and keeps the draft", async () => {
+          const id = await drafted();
+          await h.engine.stop();
+          await assert.rejects(h.engine.approve(id), /总闸或微信工作群开关已关闭/);
+          assert.deepEqual(screen.sends, []);
+          assert.equal(h.engine.getState().pending.length, 1);
+        });
+
+        it("won't send with the workbench switched off", async () => {
+          const id = await drafted();
+          await h.engine.setWorkbenchEnabled(false);
+          await assert.rejects(h.engine.approve(id), /总闸或微信工作群开关已关闭/);
+          assert.deepEqual(screen.sends, []);
+        });
+
+        it("won't send to a group no longer on the list", async () => {
+          const id = await drafted();
+          h.engine.removeWorkbenchGroup("财务报销群");
+          await assert.rejects(h.engine.approve(id), /不在允许名单/);
+          assert.deepEqual(screen.sends, []);
+        });
+
+        it("keeps the draft and says why when the send is refused", async () => {
+          const id = await drafted();
+          screen.sendAnswer = async () => ({ state: "refused", reason: "wrong-chat" });
+          await assert.rejects(h.engine.approve(id), /标题对不上，没有发送/);
+          assert.equal(h.engine.getState().pending.length, 1);
+          assert.ok(h.activity.some((entry) => entry.startsWith("blocked:") && entry.includes("标题对不上")));
+          assert.equal(h.activity.some((entry) => entry.includes("已发到群里")), false);
+        });
+
+        it("doesn't call an uncertain send sent, or try again on its own", async () => {
+          const id = await drafted();
+          screen.sendAnswer = async () => ({ state: "uncertain", reason: "not-shown" });
+          await assert.rejects(h.engine.approve(id), /不确定有没有发出去/);
+          assert.equal(screen.sends.length, 1);
+          assert.equal(h.engine.getState().pending.length, 1);
+          assert.ok(h.activity.some((entry) => entry.startsWith("error:") && entry.includes("不确定有没有发出去")));
+        });
+
+        it("passes on a failure, keeps the draft and carries on", async () => {
+          const id = await drafted();
+          screen.sendAnswer = async () => {
+            throw new Error("发送已中止。");
+          };
+          await assert.rejects(h.engine.approve(id), /发送已中止/);
+          assert.equal(h.engine.getState().pending.length, 1);
+          assert.equal(h.engine.getState().workbench!.sending, false);
+        });
+
+        it("sends one at a time, and shows that it's sending", async () => {
+          const id = await drafted();
+          let finish!: (outcome: SendOutcome) => void;
+          screen.sendAnswer = () => new Promise<SendOutcome>((resolve) => (finish = resolve));
+          let shownSending = false;
+          h.engine.on("state", (state) => {
+            if (state.workbench?.sending) shownSending = true;
+          });
+          const first = h.engine.approve(id);
+          await until(() => screen.sends.length === 1, "sending");
+          assert.equal(shownSending, true);
+          assert.equal(h.engine.getState().workbench!.sending, true);
+          await assert.rejects(h.engine.approve(id), /正在发送另一条/);
+          assert.equal(screen.sends.length, 1);
+          finish({ state: "sent" });
+          await first;
+          assert.equal(h.engine.getState().workbench!.sending, false);
+        });
+
+        it("ends a send under way when the master switch goes off", async () => {
+          const id = await drafted();
+          let fail!: (error: Error) => void;
+          screen.sendAnswer = () => new Promise<SendOutcome>((_, reject) => (fail = reject));
+          const stopsBefore = screen.stops;
+          const sending = h.engine.approve(id);
+          await until(() => screen.sends.length === 1, "sending");
+          await h.engine.stop();
+          assert.equal(screen.stops, stopsBefore + 1);
+          fail(new Error("发送已中止。"));
+          await assert.rejects(sending, /发送已中止/);
+          assert.equal(h.engine.getState().pending.length, 1);
+        });
       });
 
       it("can be ignored", async () => {

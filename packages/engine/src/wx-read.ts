@@ -55,6 +55,46 @@ export function mentionReminder(group: string, note?: string): string {
   return [`“${cut(group, MAX_GROUP_CHARS)}”里有人 @ 你。`, ...(note ? [note] : [])].join("\n");
 }
 
+const MAX_SENT_CHARS = 1000;
+
+// What's wrong with this text as something to send to a group, as the owner would need it put.
+export function draftProblem(text: string): string | null {
+  if (!text.trim()) return "草稿是空的。";
+  if (/[【】]/.test(text)) return "草稿里还有【】，填好再发送。";
+  if (/[\r\n]/.test(text)) return "草稿里有换行，微信里换行等于发送，请改成一行。";
+  if (text.length > MAX_SENT_CHARS) return `草稿太长了，最多 ${MAX_SENT_CHARS} 字。`;
+  return null;
+}
+
+// In the owner's words, what stopped a send. Each of these means Enter was never pressed.
+const REFUSALS: Record<string, string> = {
+  "bad-text": "这段文字发不了，没有发送。",
+  "owner-busy": "你一直在操作键盘或鼠标，没有发送。松手约 3 秒后再试。",
+  missing: "没找到微信窗口，没有发送。",
+  "lost-focus": "发送途中微信失去了焦点，已经停下，没有发送。输入框或搜索框里可能留有文字。",
+  "input-rejected": "Windows 拒绝了模拟输入，没有发送。",
+  "search-failed": "没能打开微信搜索，没有发送。当前聊天的输入框里可能留有群名，请看一下。",
+  "not-top-result": "搜索结果第一行不是这个群，没有发送。请先在微信里点开这个群再试。",
+  "wrong-chat": "打开的聊天标题对不上，没有发送。",
+  "no-input-box": "找不到微信的输入框，没有发送。",
+  "input-not-empty": "这个群的输入框里有没发的文字，没有发送，免得一起发出去。请先处理掉。",
+  "not-typed": "文字没有打进输入框，没有发送。",
+  "typed-mismatch": "输入框里的文字和草稿对不上，已清空，没有发送。",
+};
+
+// Enter was pressed. It may well have gone out, so the owner has to look before trying again.
+const UNCERTAIN: Record<string, string> = {
+  "no-capture": "已按回车，但截不到微信窗口。",
+  "still-in-input": "已按回车，但文字还在输入框里。",
+  "not-shown": "已按回车，但在聊天里没读到这条消息。",
+};
+
+export function sendProblem(outcome: { state: string; reason?: string }): string {
+  const reason = outcome.reason ?? "";
+  if (outcome.state === "refused") return REFUSALS[reason] ?? `没有发送（${reason}）。`;
+  return `不确定有没有发出去。${UNCERTAIN[reason] ?? ""}请看一下微信，确认没发出去再重试。`;
+}
+
 // A line break in WeChat's input box sends the message, so a draft stays on one line.
 export function cleanDraft(read: ChatRead): string | null {
   return cut(read.draft ?? "", MAX_DRAFT_CHARS) || null;
@@ -67,7 +107,7 @@ export function readReminder(group: string, read: ChatRead): string {
     [
       read.mention ? `${read.mention.sender ?? "有人"}：${cut(read.mention.text, MAX_MENTION_CHARS)}` : "",
       cut(read.summary, MAX_SUMMARY_CHARS),
-      draft ? `草稿：${draft}\n可以到控制台的“待确认”里修改或忽略。` : "",
+      draft ? `草稿：${draft}\n要发送的话，到控制台的“待确认”里确认。` : "",
     ]
       .filter(Boolean)
       .join("\n"),

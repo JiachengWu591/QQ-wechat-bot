@@ -9,15 +9,18 @@ import { WxHelperScreen } from "../src/wx-screen.ts";
 
 const windowsOnly = { skip: process.platform === "win32" ? false : "needs Windows PowerShell" };
 
-const realHelper = fileURLToPath(new URL("../src/wx-helper.ps1", import.meta.url));
+const script = (name: string) => readFileSync(fileURLToPath(new URL(`../src/${name}`, import.meta.url)), "utf8");
+const readingCode = () => script("wx-helper.ps1") + script("wx-common.ps1");
 
 describe("the real helper", windowsOnly, () => {
   const screen = new WxHelperScreen();
   after(() => screen.stop());
 
-  it("stays ASCII, because Windows PowerShell 5.1 misreads UTF-8 without a BOM", () => {
-    assert.doesNotMatch(readFileSync(realHelper, "utf8"), /[^\x00-\x7F]/);
-  });
+  for (const name of ["wx-common.ps1", "wx-helper.ps1", "wx-send.ps1"]) {
+    it(`keeps ${name} ASCII, because Windows PowerShell 5.1 misreads UTF-8 without a BOM`, () => {
+      assert.doesNotMatch(script(name), /[^\x00-\x7F]/);
+    });
+  }
 
   it("finds rows with the marker in a generated list, with their names, and no others", async () => {
     const result = await screen.selfTest();
@@ -44,15 +47,88 @@ describe("the real helper", windowsOnly, () => {
     assert.ok(titleMatches(result.titles, "项目周会群"), JSON.stringify(result.titles));
   });
 
-  it("can't type or take focus: the Windows calls for that aren't there", () => {
-    const source = readFileSync(realHelper, "utf8");
-    assert.doesNotMatch(source, /SendInput|keybd_event|SendMessage|mouse_event|SetForegroundWindow|SetCursorPos|WM_KEY|WM_CHAR|WM_PASTE|Clipboard/);
+  it("can't type or take focus: the Windows calls for that aren't in what stays running", () => {
+    assert.doesNotMatch(readingCode(), /SendInput|keybd_event|SendMessage|mouse_event|SetForegroundWindow|SetCursorPos|ShowWindow|WM_KEY|WM_CHAR|WM_PASTE|Clipboard/);
   });
 
   it("only posts the messages for moving the mouse over a row, clicking it and scrolling", () => {
-    const source = readFileSync(realHelper, "utf8");
-    const posted = [...source.matchAll(/\[Win\]::PostMessage\(\$window\.Handle, (\$WM_[A-Z]+),/g)].map((match) => match[1]);
+    const posted = [...readingCode().matchAll(/\[Win\]::PostMessage\(\$window\.Handle, (\$WM_[A-Z]+),/g)].map((match) => match[1]);
     assert.deepEqual([...new Set(posted)].sort(), ["$WM_LBUTTONDOWN", "$WM_LBUTTONUP", "$WM_MOUSEMOVE", "$WM_MOUSEWHEEL"]);
+  });
+});
+
+describe("the real sender", windowsOnly, () => {
+  const screen = new WxHelperScreen();
+  after(() => screen.stop());
+
+  it("checks what Enter would open, what's in the input box and which chat is open, on generated images", async () => {
+    const results = await screen.selfTestSend();
+    assert.deepEqual(results, {
+      state: "ok",
+      // The search result Enter would open.
+      nameInBand: true,
+      otherNameInBand: false,
+      nameBelowBand: false,
+      bandTop: 50,
+      bandBottom: 130,
+      // The input card is found exactly, above the window's shadow.
+      boxTop: 0,
+      boxBottom: 0,
+      // The input box, which its icons or a blinking caret mustn't count as filling.
+      emptyIsEmpty: true,
+      caretIsEmpty: true,
+      textIsEmpty: false,
+      readsTyped: true,
+      readsOther: false,
+      latinAlwaysPasses: true,
+      // Roughly the right text, from reads as poor as the real ones.
+      misreadPasses: true,
+      wrongTextFails: false,
+      halfIsEnough: true,
+      lessThanHalfIsNot: false,
+      onlyTheEndCounts: false,
+      // The sent message showing up.
+      shownBeforeSending: false,
+      shownAfterSending: true,
+      otherNotShown: false,
+      latinNotHeldAgainst: true,
+      // The chat's title.
+      titleExact: true,
+      titleWithCount: true,
+      titleOneRead: true,
+      titleOther: false,
+      titleLonger: false,
+      titleCountThenMore: false,
+    });
+  });
+
+  it("presses Enter in only two places: on the checked search result, and after every last check", () => {
+    const source = script("wx-send.ps1");
+    assert.equal([...source.matchAll(/Combo\(\$VK_RETURN\)/g)].length, 2);
+    const send = source.indexOf("function Invoke-Send");
+    const finalEnter = source.indexOf("Combo($VK_RETURN)", send);
+    for (const check of ["Test-InputEmpty $image", "Test-Title (Get-Titles $image) $group", "Test-TypedText $image $text", "Assert-Foreground $window"]) {
+      const at = source.lastIndexOf(check, finalEnter);
+      assert.ok(at > source.indexOf("Send-Text $window $text", send), `${check} comes after typing and before Enter`);
+    }
+  });
+
+  it("stops a rehearsal after every check, before Enter, and clears what it typed", () => {
+    const source = script("wx-send.ps1");
+    const send = source.indexOf("function Invoke-Send");
+    const rehearsal = source.indexOf("if ($rehearse) { Clear-Typed $window; return @{ state = 'refused'; reason = 'rehearsal' } }", send);
+    assert.ok(rehearsal > source.indexOf("Test-TypedText $image $text", send));
+    assert.ok(rehearsal < source.indexOf("Combo($VK_RETURN)", send));
+  });
+
+  it("doesn't try again, or clear the box, once Enter has been pressed", () => {
+    const source = script("wx-send.ps1");
+    const afterEnter = source.slice(source.indexOf("Combo($VK_RETURN)", source.indexOf("function Invoke-Send")), source.indexOf("function Invoke-SelfTest"));
+    assert.doesNotMatch(afterEnter, /Clear-Typed|Send-Text|VK_RETURN\)\s*\n\s*\[Keys\]::Combo/);
+  });
+
+  it("uses no clipboard", () => {
+    assert.doesNotMatch(script("wx-send.ps1"), /Clipboard|WM_PASTE/);
   });
 });
 
@@ -169,5 +245,75 @@ ${answering(`[Console]::Out.WriteLine('{"id":' + $id + ',"state":"blank"}'); [Co
   it("says when the helper's script is missing", async () => {
     screen = new WxHelperScreen({ script: join(directory, "missing.ps1") });
     await assert.rejects(screen.scan(), /读取程序/);
+  });
+
+  describe("sending", () => {
+    function sender(body: string, sendTimeoutMs?: number) {
+      const senderScript = join(directory, `sender-${count++}.ps1`);
+      writeFileSync(senderScript, body);
+      screen = new WxHelperScreen({ senderScript, ...(sendTimeoutMs ? { sendTimeoutMs } : {}) });
+      return screen;
+    }
+    const reply = (json: string) => `$request = ConvertFrom-Json ([Console]::In.ReadLine())\n[Console]::Out.WriteLine('${json}')`;
+
+    it("passes on the answer", async () => {
+      assert.deepEqual(await sender(reply('{"state":"sent"}')).sendText("甲", "乙"), { state: "sent" });
+      assert.deepEqual(await sender(reply('{"state":"refused","reason":"wrong-chat"}')).sendText("甲", "乙"), { state: "refused", reason: "wrong-chat" });
+    });
+
+    it("gets Chinese across, whatever the console's code page", async () => {
+      const echo = `$r = ConvertFrom-Json ([Console]::In.ReadLine())
+$codes = (($r.group + '|' + $r.text).ToCharArray() | ForEach-Object { [int]$_ }) -join ','
+[Console]::Out.WriteLine('{"state":"refused","reason":"' + $codes + '"}')`;
+      const outcome = (await sender(echo).sendText("项目周会群", "好的，收到😀")) as { reason: string };
+      const received = String.fromCharCode(...outcome.reason.split(",").map(Number));
+      assert.equal(received, "项目周会群|好的，收到😀");
+    });
+
+    it("doesn't hand the sender the engine's secrets", async () => {
+      process.env.SHU_ANTHROPIC_API_KEY = "secret-for-test";
+      try {
+        const body = `$null = [Console]::In.ReadLine(); $has = if ($env:SHU_ANTHROPIC_API_KEY) { 'yes' } else { 'no' }; [Console]::Out.WriteLine('{"state":"refused","reason":"' + $has + '"}')`;
+        assert.deepEqual(await sender(body).sendText("甲", "乙"), { state: "refused", reason: "no" });
+      } finally {
+        delete process.env.SHU_ANTHROPIC_API_KEY;
+      }
+    });
+
+    it("starts a new sender for each send", async () => {
+      const body = `$null = [Console]::In.ReadLine(); [Console]::Out.WriteLine('{"state":"refused","reason":"' + $PID + '"}')`;
+      sender(body);
+      const first = (await screen.sendText("甲", "乙")) as { reason: string };
+      const second = (await screen.sendText("甲", "乙")) as { reason: string };
+      assert.notEqual(first.reason, second.reason);
+    });
+
+    it("ends the sender at once when stopped, and says the box may hold unsent text", async () => {
+      const sending = sender(`Start-Sleep -Seconds 60`).sendText("甲", "乙");
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      await screen.stop();
+      await assert.rejects(sending, /中止.*输入框/);
+    });
+
+    it("ends a sender that takes too long, rather than waiting for it", async () => {
+      const started = Date.now();
+      await assert.rejects(sender(`Start-Sleep -Seconds 60`, 1500).sendText("甲", "乙"), /超时.*输入框/);
+      assert.ok(Date.now() - started < 20_000, "it didn't wait for the sender to finish by itself");
+    });
+
+    it("asks for a rehearsal only when told to, so an ordinary send can't be one by accident", async () => {
+      const body = `$r = ConvertFrom-Json ([Console]::In.ReadLine()); [Console]::Out.WriteLine('{"state":"refused","reason":"' + $r.rehearse + '"}')`;
+      assert.deepEqual(await sender(body).rehearseSend("甲", "乙"), { state: "refused", reason: "True" });
+      assert.deepEqual(await sender(body).sendText("甲", "乙"), { state: "refused", reason: "" });
+    });
+
+    it("reports the sender's own errors", async () => {
+      await assert.rejects(sender(reply('{"error":"boom"}')).sendText("甲", "乙"), /发送出错：boom/);
+    });
+
+    it("treats output it can't read as a failure, never as sent", async () => {
+      await assert.rejects(sender(`[Console]::Out.WriteLine('sent')`).sendText("甲", "乙"), /发送程序退出了/);
+      await assert.rejects(sender(`exit 3`).sendText("甲", "乙"), /发送程序退出了（3）/);
+    });
   });
 });

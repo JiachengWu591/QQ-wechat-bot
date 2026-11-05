@@ -3,7 +3,7 @@
 // group the owner has allowed gets opened and read, which marks that chat as read. Any other chat
 // is left exactly as it was.
 import type { WorkbenchStatus } from "@shu/protocol";
-import type { ScreenMention, ScreenScan, WeChatScreen } from "./wx-screen.ts";
+import type { ScreenMention, ScreenScan, SendOutcome, WeChatScreen } from "./wx-screen.ts";
 
 // One scan can miss a marker that's still there, and that mustn't count as a new @ afterwards.
 const SCANS_BEFORE_GONE = 3;
@@ -108,6 +108,9 @@ export class Workbench {
   // Allowed groups with a mention that hasn't been read yet.
   #toRead = new Set<string>();
   #reading: AbortController | null = null;
+  #readFinished: Promise<void> = Promise.resolve();
+  // While set, nothing else may click or scroll in the window.
+  #sending = false;
 
   constructor(options: {
     screen: WeChatScreen;
@@ -152,6 +155,17 @@ export class Workbench {
     await this.#screen.stop();
   }
 
+  // Waits for any read to finish, and keeps new ones from starting, since both work in the window.
+  async sendDraft(group: string, text: string): Promise<SendOutcome> {
+    this.#sending = true;
+    try {
+      await this.#readFinished;
+      return await this.#screen.sendText(group, text);
+    } finally {
+      this.#sending = false;
+    }
+  }
+
   async #scan(run: number) {
     const stale = () => run !== this.#run;
     try {
@@ -159,7 +173,7 @@ export class Workbench {
       if (stale()) return;
       if (result.state === "ok") {
         this.#observe(result.mentions);
-        const next = this.#nextToRead(result);
+        const next = this.#sending ? null : this.#nextToRead(result);
         if (next && result.foreground && result.idleMs < IN_USE_IDLE_MS) {
           this.#onStatus({ state: "scanning", detail: `你正在用微信，等你停下来再读“${next.group}”。` });
         } else {
@@ -167,7 +181,8 @@ export class Workbench {
           // One at a time. Rows can move during a read, so the next one waits for a new scan.
           if (next) {
             this.#toRead.delete(next.group);
-            await this.#read(next.group, next.y, run);
+            this.#readFinished = this.#read(next.group, next.y, run);
+            await this.#readFinished;
             if (stale()) return;
           }
         }

@@ -142,6 +142,8 @@ export type WorkbenchView = {
   status: WorkbenchStatus;
   allowedGroups: string[];
   intervalSeconds: number;
+  // An approved reply is being typed into WeChat right now.
+  sending: boolean;
 };
 
 export type EngineState = {

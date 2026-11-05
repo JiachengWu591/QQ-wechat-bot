@@ -3,15 +3,29 @@ import { WECHAT_WORK_CHANNEL_ID, type EngineState, type PendingReply } from "@sh
 import { formatCost, formatTime, tierLabels } from "../ui.tsx";
 import type { EngineApi } from "../useEngine.ts";
 
-function PendingCard({ reply, engine, running }: { reply: PendingReply; engine: EngineApi; running: boolean }) {
+function PendingCard({ reply, engine, state }: { reply: PendingReply; engine: EngineApi; state: EngineState }) {
   const [draft, setDraft] = useState(reply.draft);
   const [copied, setCopied] = useState(false);
   const trimmed = draft.trim();
+  const { running, workbench } = state;
   const isWorkGroup = reply.channelId === WECHAT_WORK_CHANNEL_ID;
+  const sending = isWorkGroup && Boolean(workbench?.sending);
+  const unfilled = isWorkGroup && /[【】]/.test(trimmed);
+  const multiline = isWorkGroup && /\n/.test(trimmed);
+  const blocked = isWorkGroup && !workbench?.enabled;
+  const approve = () => engine.send({ type: "pending.approve", pendingId: reply.id, ...(trimmed === reply.draft ? {} : { text: trimmed }) });
 
   async function copy() {
     await navigator.clipboard.writeText(trimmed);
     setCopied(true);
+  }
+
+  function workGroupNote(): string {
+    if (sending) return "正在发送，先不要碰键盘和鼠标。";
+    if (!running || blocked) return "总闸和微信工作群开关都打开后才能发送。";
+    if (unfilled) return "草稿里还有【】，填好才能发送。";
+    if (multiline) return "微信里换行等于发送，请改成一行。";
+    return "发送时会短暂切到微信，你约 3 秒没操作后开始，发完切回来。发出去就收不回了。";
   }
 
   return (
@@ -30,26 +44,30 @@ function PendingCard({ reply, engine, running }: { reply: PendingReply; engine: 
         回复草稿
       </label>
       <textarea id={`draft-${reply.id}`} rows={3} value={draft} onChange={(event) => setDraft(event.target.value)} />
-      <div className="actions">
-        {isWorkGroup ? (
-          <button type="button" className="button button-primary" disabled={!trimmed} onClick={() => void copy()}>
+      {isWorkGroup ? (
+        <div className="actions">
+          <button type="button" className="button button-primary" disabled={!running || blocked || sending || unfilled || multiline || !trimmed} onClick={approve}>
+            发送到“{reply.conversationTitle}”
+          </button>
+          <button type="button" className="button" disabled={!trimmed} onClick={() => void copy()}>
             {copied ? "已复制" : "复制草稿"}
           </button>
-        ) : (
-          <button
-            type="button"
-            className="button button-primary"
-            disabled={!running || !trimmed}
-            onClick={() => engine.send({ type: "pending.approve", pendingId: reply.id, ...(trimmed === reply.draft ? {} : { text: trimmed }) })}
-          >
+          <button type="button" className="button" disabled={sending} onClick={() => engine.send({ type: "pending.reject", pendingId: reply.id })}>
+            忽略
+          </button>
+          <span className="panel-meta">{workGroupNote()}</span>
+        </div>
+      ) : (
+        <div className="actions">
+          <button type="button" className="button button-primary" disabled={!running || !trimmed} onClick={approve}>
             确认发送
           </button>
-        )}
-        <button type="button" className="button" onClick={() => engine.send({ type: "pending.reject", pendingId: reply.id })}>
-          忽略
-        </button>
-        {isWorkGroup ? <span className="panel-meta">这一版还不能自动发到工作群，复制后自己发。</span> : !running ? <span className="panel-meta">总闸关闭时不能发送</span> : null}
-      </div>
+          <button type="button" className="button" onClick={() => engine.send({ type: "pending.reject", pendingId: reply.id })}>
+            忽略
+          </button>
+          {!running ? <span className="panel-meta">总闸关闭时不能发送</span> : null}
+        </div>
+      )}
     </article>
   );
 }
@@ -59,7 +77,7 @@ export function PendingPage({ engine, state }: { engine: EngineApi; state: Engin
     <>
       <h1 className="page-title">待确认</h1>
       {state.pending.length ? (
-        state.pending.map((reply) => <PendingCard key={reply.id} reply={reply} engine={engine} running={state.running} />)
+        state.pending.map((reply) => <PendingCard key={reply.id} reply={reply} engine={engine} state={state} />)
       ) : (
         <p className="empty">没有等你确认的回复。设为“确认后发送”的聊天和微信工作群的草稿，会先出现在这里。</p>
       )}
