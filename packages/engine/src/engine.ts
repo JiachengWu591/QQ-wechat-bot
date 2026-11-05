@@ -635,7 +635,7 @@ export class Engine extends EventEmitter<EngineEvents> {
       if (outcome.state !== "sent") {
         const message = sendProblem(outcome);
         if (outcome.state === "uncertain") this.#markSendUncertain(reply, text);
-        this.#log(outcome.state === "uncertain" ? "error" : "blocked", message, group);
+        this.#log(outcome.state === "uncertain" ? "error" : "blocked", `${message}${mention ? `（@ 的是“${mention}”）` : ""}`, group);
         throw new Error(message);
       }
       this.#store.removePending(reply.id);

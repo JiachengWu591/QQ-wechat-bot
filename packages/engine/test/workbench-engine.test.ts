@@ -549,8 +549,9 @@ describe("reading WeChat from the engine", () => {
         it("keeps the draft and says why when the person can't be picked", async () => {
           const id = await drafted();
           screen.sendAnswer = async () => ({ state: "refused", reason: "mention-not-found" });
-          await assert.rejects(h.engine.approve(id, undefined, { mention: "小红" }), /选中的不是这个人，已清空，没有发送/);
+          await assert.rejects(h.engine.approve(id, undefined, { mention: "小红" }), /选中的不是这个人，已清空，没有发送.*不是微信号/);
           assert.equal(h.engine.getState().pending[0]!.sendUncertain, undefined);
+          assert.ok(h.activity.some((entry) => entry.startsWith("blocked:") && entry.includes("（@ 的是“小红”）")), "the log says which name it tried");
         });
 
         it("treats the picking Enter sending the box as uncertain", async () => {

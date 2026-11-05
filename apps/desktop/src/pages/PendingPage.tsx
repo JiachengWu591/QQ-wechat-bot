@@ -56,7 +56,7 @@ function PendingCard({ reply, engine, state }: { reply: PendingReply; engine: En
       {isWorkGroup ? (
         <label className="mention-field">
           <span className="field-label">同时 @</span>
-          <input className="title-input" value={mention} maxLength={60} placeholder="留空就不 @，名字要和群里显示的完全一样" onChange={(event) => setMention(event.target.value)} />
+          <input className="title-input" value={mention} maxLength={60} placeholder="留空就不 @。要填群里显示的名字（你的备注或群昵称），不是微信号" onChange={(event) => setMention(event.target.value)} />
         </label>
       ) : null}
       {isWorkGroup ? (
