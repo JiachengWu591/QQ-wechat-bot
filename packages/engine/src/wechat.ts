@@ -7,6 +7,7 @@ import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node
 import { readFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import type { ChannelLogin, ChannelStatus } from "@shu/protocol";
+import { describeNetworkError } from "./net.ts";
 import type { Adapter, AdapterConversation, AdapterHandlers, InboundAttachment, OutboundText } from "./types.ts";
 
 export const WECHAT_CHANNEL_ID = "wechat";
@@ -513,8 +514,5 @@ export function splitText(text: string, size: number): string[] {
 }
 
 function describeError(error: unknown): string {
-  if (!(error instanceof Error)) return String(error);
-  if (error.name === "TimeoutError") return "连接微信超时";
-  const code = (error.cause as { code?: string } | undefined)?.code;
-  return code ? `网络错误（${code}）` : error.message;
+  return describeNetworkError(error, "微信");
 }

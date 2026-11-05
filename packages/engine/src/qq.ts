@@ -1,5 +1,6 @@
 // The official QQ bot platform: a gateway WebSocket for events and HTTP for sending.
 import type { ChannelStatus, ConversationKind, InboundMessage } from "@shu/protocol";
+import { describeNetworkError, networkErrorCode } from "./net.ts";
 import type { Adapter, AdapterConversation, AdapterHandlers, OutboundText } from "./types.ts";
 
 export const QQ_CHANNEL_ID = "qq";
@@ -7,6 +8,7 @@ export const QQ_CHANNEL_ID = "qq";
 const DEFAULT_API = "https://api.bot.qq.com";
 const GROUP_AND_C2C_EVENT = 1 << 25;
 const REQUEST_TIMEOUT_MS = 15_000;
+const SEND_ATTEMPTS = 3;
 const MAX_CONTENT_CHARS = 1800;
 const MAX_BACKOFF_MS = 30_000;
 const SEEN_LIMIT = 2000;
@@ -24,6 +26,13 @@ const PASSIVE_REPLY: Record<ConversationKind, { windowMs: number; limit: number 
 const FATAL_CLOSE_CODES = new Set([4010, 4011, 4012, 4013, 4014, 4914, 4915]);
 // The session is gone, so the next connection has to identify from scratch.
 const SESSION_LOST_CLOSE_CODES = new Set([4006, 4007, 4009]);
+
+// The platform's answer to a msg_id and msg_seq it has already accepted.
+const ALREADY_SENT = 40054005;
+// Its documented "try again later", for groups and private chats respectively.
+const TRY_AGAIN_LATER = new Set([50055001, 50055002]);
+// These fail before a request leaves this computer, so it can't have arrived.
+const NEVER_ARRIVED = new Set(["UND_ERR_CONNECT_TIMEOUT", "ECONNREFUSED", "ENOTFOUND", "EAI_AGAIN", "ENETUNREACH", "EHOSTUNREACH"]);
 
 const Op = { Dispatch: 0, Heartbeat: 1, Identify: 2, Resume: 6, Reconnect: 7, InvalidSession: 9, Hello: 10, HeartbeatAck: 11 } as const;
 
@@ -59,6 +68,14 @@ export class QqApiError extends Error {
     this.status = status;
     this.code = code;
   }
+}
+
+// A reply can always go again, because the platform refuses a second copy of the same msg_id
+// and msg_seq. Nothing protects an ordinary message, so that only goes again if the first try
+// can't have arrived.
+function worthRetrying(error: unknown, isReply: boolean): boolean {
+  if (error instanceof QqApiError) return TRY_AGAIN_LATER.has(error.code ?? 0) || (isReply && error.status >= 500);
+  return isReply || NEVER_ARRIVED.has(networkErrorCode(error) ?? "");
 }
 
 // Unreported links get a message rejected outright (304003), so links never go out.
@@ -133,7 +150,28 @@ export class QqAdapter implements Adapter {
     const content = prepareContent(message.text);
     if (!content) return;
     const base = message.conversationKind === "group" ? `/v2/groups/${message.conversationId}/messages` : `/v2/users/${message.conversationId}/messages`;
-    await this.#request("POST", base, { content, msg_type: 0, ...this.#passiveFields(message.replyToId) });
+    // Every try carries the same msg_seq, so it counts as one reply and can't arrive twice.
+    const passive = this.#passiveFields(message.replyToId);
+    const isReply = "msg_id" in passive;
+
+    let lastError: unknown;
+    for (let attempt = 0; attempt < SEND_ATTEMPTS; attempt++) {
+      if (attempt > 0) {
+        await new Promise((resolve) => setTimeout(resolve, this.#baseBackoffMs * attempt));
+        // Switched off during the wait, so this must not go out any more.
+        if (this.#stopped) break;
+      }
+      try {
+        await this.#request("POST", base, { content, msg_type: 0, ...passive });
+        return;
+      } catch (error) {
+        // An earlier try got through after all, and only its answer was lost.
+        if (attempt > 0 && error instanceof QqApiError && error.code === ALREADY_SENT) return;
+        lastError = error;
+        if (!worthRetrying(error, isReply)) break;
+      }
+    }
+    throw lastError instanceof QqApiError ? lastError : new Error(describeNetworkError(lastError, "QQ"), { cause: lastError });
   }
 
   #passiveFields(replyToId: string | undefined): { msg_id: string; msg_seq: number } | Record<string, never> {
@@ -155,7 +193,7 @@ export class QqAdapter implements Adapter {
       if (!gateway.url) throw new Error("没有拿到网关地址");
       url = gateway.url;
     } catch (error) {
-      return this.#scheduleReconnect(error instanceof Error ? error.message : String(error));
+      return this.#scheduleReconnect(describeNetworkError(error, "QQ"));
     }
     if (this.#stopped) return;
 

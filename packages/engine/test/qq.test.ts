@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
-import { afterEach, describe, it } from "node:test";
+import { afterEach, describe, it, type TestContext } from "node:test";
 import type { ChannelStatus, InboundMessage } from "@shu/protocol";
 import { WebSocketServer, type WebSocket } from "ws";
-import { prepareContent, QqAdapter } from "../src/qq.ts";
+import { describeNetworkError, networkErrorCode } from "../src/net.ts";
+import { prepareContent, QqAdapter, QqApiError } from "../src/qq.ts";
 
 const SELF = "bot-openid";
 const GROUP = "group-openid-abcdef";
@@ -26,6 +27,10 @@ class FakeQq {
   heartbeatIntervalMs = 40;
   sendFailure: { status: number; body: unknown } | null = null;
   rejectTokenOnce = false;
+  // What happens to each coming send, in order. Once these run out, sends work normally.
+  sendPlan: Array<"drop" | "arrive-then-drop" | { status: number; body: unknown }> = [];
+  sendAttempts = 0;
+  #acceptedReplies = new Set<string>();
   #seq = 0;
 
   constructor() {
@@ -46,8 +51,18 @@ class FakeQq {
           this.rejectTokenOnce = false;
           return respond(401, { code: 11244, message: "token expired" });
         }
+        this.sendAttempts++;
         if (this.sendFailure) return respond(this.sendFailure.status, this.sendFailure.body);
-        this.sent.push({ path: req.url ?? "", body: JSON.parse(raw) });
+        const step = this.sendPlan.shift();
+        if (step === "drop") return req.socket.destroy();
+        if (step && step !== "arrive-then-drop") return respond(step.status, step.body);
+        const body = JSON.parse(raw);
+        // The real platform refuses a second copy of a reply.
+        const reply = body.msg_id ? `${body.msg_id}/${body.msg_seq}` : null;
+        if (reply && this.#acceptedReplies.has(reply)) return respond(400, { code: 40054005, message: "消息被去重" });
+        if (reply) this.#acceptedReplies.add(reply);
+        this.sent.push({ path: req.url ?? "", body });
+        if (step === "arrive-then-drop") return req.socket.destroy();
         respond(200, { id: "sent" });
       });
     });
@@ -113,12 +128,12 @@ describe("QQ adapter", () => {
   const statuses: ChannelStatus[] = [];
   const messages: InboundMessage[] = [];
 
-  async function connect() {
+  async function connect(backoffMs = 5) {
     fake = new FakeQq();
     await fake.listen();
     statuses.length = 0;
     messages.length = 0;
-    adapter = new QqAdapter({ appId: "app", appSecret: "secret", apiBase: `http://127.0.0.1:${fake.port}`, backoffMs: 5 });
+    adapter = new QqAdapter({ appId: "app", appSecret: "secret", apiBase: `http://127.0.0.1:${fake.port}`, backoffMs });
     await adapter.start({ onMessage: (message) => messages.push(message), onStatus: (status) => statuses.push(status) });
     await until(() => statuses.at(-1)?.state === "connected", "connected");
   }
@@ -350,6 +365,226 @@ describe("QQ adapter", () => {
     fake = new FakeQq();
     await fake.listen();
     adapter = dead;
+  });
+
+  it("says what went wrong while reconnecting, not just that a fetch failed", async () => {
+    fake = new FakeQq();
+    await fake.listen();
+    const closedPort = fake.port;
+    await fake.close();
+    adapter = new QqAdapter({ appId: "app", appSecret: "secret", apiBase: `http://127.0.0.1:${closedPort}`, backoffMs: 5 });
+    const seen: ChannelStatus[] = [];
+    await adapter.start({ onMessage: () => {}, onStatus: (status) => seen.push(status) });
+    await until(() => seen.some((status) => status.detail), "a reason");
+    assert.equal(seen.find((status) => status.detail)!.detail, "网络错误（ECONNREFUSED），正在重连");
+    await adapter.stop();
+    fake = new FakeQq();
+    await fake.listen();
+  });
+
+  describe("when a send fails", () => {
+    const ordinary = (text = "你好") => adapter.send({ channelId: "qq", conversationId: GROUP, conversationKind: "group", text });
+    const reply = (text = "你好") => adapter.send({ channelId: "qq", conversationId: GROUP, conversationKind: "group", text, replyToId: "m1" });
+
+    async function connectWithMessageToReplyTo(backoffMs?: number) {
+      await connect(backoffMs);
+      fake.dispatch("GROUP_MESSAGE_CREATE", groupEvent({ id: "m1" }));
+      await until(() => messages.length === 1, "message");
+    }
+
+    // Fails the first send with this error before it reaches the network. Sends after that,
+    // and every other request, go through as usual.
+    function failFirstSend(t: TestContext, failure: Error) {
+      const realFetch = globalThis.fetch;
+      let failed = false;
+      const calls = { sends: 0 };
+      t.mock.method(globalThis, "fetch", async (url: string, init?: RequestInit) => {
+        if (String(url).includes("/messages")) {
+          calls.sends++;
+          if (!failed) {
+            failed = true;
+            throw failure;
+          }
+        }
+        return realFetch(url, init);
+      });
+      return calls;
+    }
+
+    const networkFailure = (code: string) => new TypeError("fetch failed", { cause: Object.assign(new Error(code), { code }) });
+    const timeout = () => new DOMException("The operation was aborted due to timeout", "TimeoutError");
+
+    it("sends a reply again after the connection drops, as the same reply", async () => {
+      await connectWithMessageToReplyTo();
+      fake.sendPlan = ["drop"];
+      await reply("第一条");
+      assert.equal(fake.sendAttempts, 2);
+      assert.deepEqual(fake.sent.map((request) => [request.body.content, request.body.msg_id, request.body.msg_seq]), [["第一条", "m1", 1]]);
+
+      await reply("第二条");
+      assert.equal(fake.sent[1]!.body.msg_seq, 2, "the retry didn't use up a reply");
+    });
+
+    it("doesn't post a reply twice when only the answer to the first try was lost", async () => {
+      await connectWithMessageToReplyTo();
+      fake.sendPlan = ["arrive-then-drop"];
+      await reply();
+      assert.equal(fake.sendAttempts, 2);
+      assert.equal(fake.sent.length, 1);
+    });
+
+    it("treats a duplicate on the very first try as an error, since nothing had been sent", async () => {
+      await connectWithMessageToReplyTo();
+      fake.sendPlan = [{ status: 400, body: { code: 40054005, message: "消息被去重" } }];
+      await assert.rejects(reply(), /40054005/);
+      assert.equal(fake.sendAttempts, 1);
+    });
+
+    it("gets a reply through on the last try", async () => {
+      await connectWithMessageToReplyTo();
+      fake.sendPlan = ["drop", "drop"];
+      await reply();
+      assert.equal(fake.sendAttempts, 3);
+      assert.equal(fake.sent.length, 1);
+    });
+
+    it("gives up on a reply after three tries and says why", async () => {
+      await connectWithMessageToReplyTo();
+      fake.sendPlan = ["drop", "drop", "drop", "drop"];
+      await assert.rejects(reply(), /^Error: 网络错误（UND_ERR_SOCKET）$/);
+      assert.equal(fake.sendAttempts, 3);
+      assert.equal(fake.sent.length, 0);
+    });
+
+    it("sends a reply again after a timeout", async (t) => {
+      await connectWithMessageToReplyTo();
+      const calls = failFirstSend(t, timeout());
+      await reply();
+      assert.equal(calls.sends, 2);
+      assert.equal(fake.sent.length, 1);
+    });
+
+    it("sends a reply again after a server error, but not an ordinary message, which may have gone out", async () => {
+      await connectWithMessageToReplyTo();
+      fake.sendPlan = [{ status: 500, body: {} }];
+      await reply();
+      assert.equal(fake.sendAttempts, 2);
+      assert.equal(fake.sent.length, 1);
+
+      fake.sendAttempts = 0;
+      fake.sendPlan = [{ status: 500, body: {} }];
+      await assert.rejects(ordinary(), /QQ 接口错误 500/);
+      assert.equal(fake.sendAttempts, 1);
+    });
+
+    it("doesn't send an ordinary message again when it may have arrived", async () => {
+      await connect();
+      fake.sendPlan = ["arrive-then-drop"];
+      await assert.rejects(ordinary(), /网络错误（UND_ERR_SOCKET）/);
+      assert.equal(fake.sendAttempts, 1);
+      assert.equal(fake.sent.length, 1);
+    });
+
+    it("doesn't send an ordinary message again after a timeout, and says what happened", async (t) => {
+      await connect();
+      const calls = failFirstSend(t, timeout());
+      await assert.rejects(ordinary(), /连接QQ超时/);
+      assert.equal(calls.sends, 1);
+    });
+
+    for (const code of ["UND_ERR_CONNECT_TIMEOUT", "ECONNREFUSED", "ENOTFOUND", "EAI_AGAIN", "ENETUNREACH", "EHOSTUNREACH"]) {
+      it(`sends an ordinary message again after ${code}, which means it never left`, async (t) => {
+        await connect();
+        const calls = failFirstSend(t, networkFailure(code));
+        await ordinary();
+        assert.equal(calls.sends, 2);
+        assert.equal(fake.sent.length, 1);
+      });
+    }
+
+    for (const code of [50055001, 50055002]) {
+      it(`sends anything again when the platform says to try later (${code})`, async () => {
+        await connect();
+        fake.sendPlan = [{ status: 500, body: { code, message: "消息发送异常，请稍后重试" } }];
+        await ordinary();
+        assert.equal(fake.sendAttempts, 2);
+        assert.equal(fake.sent.length, 1);
+      });
+    }
+
+    it("doesn't try again when the platform refuses the message, and passes on its error", async () => {
+      const refusal = (error: unknown) => error instanceof QqApiError && error.status === 400 && error.code === 304003;
+      await connectWithMessageToReplyTo();
+      fake.sendFailure = { status: 400, body: { code: 304003, message: "url not allowed" } };
+      await assert.rejects(reply(), refusal);
+      assert.equal(fake.sendAttempts, 1);
+      fake.sendAttempts = 0;
+      await assert.rejects(ordinary(), refusal);
+      assert.equal(fake.sendAttempts, 1);
+    });
+
+    it("reports a refusal that comes back on a later try, instead of taking it for success", async () => {
+      await connectWithMessageToReplyTo();
+      fake.sendPlan = ["drop", { status: 400, body: { code: 304003, message: "url not allowed" } }];
+      await assert.rejects(reply(), /304003/);
+      assert.equal(fake.sendAttempts, 2);
+      assert.equal(fake.sent.length, 0);
+    });
+
+    it("stops trying once switched off, so a written reply can't go out afterwards", async () => {
+      await connectWithMessageToReplyTo(150);
+      fake.sendPlan = ["drop", "drop"];
+      const sending = reply();
+      await until(() => fake.sendAttempts === 1, "first try");
+      await adapter.stop();
+      await assert.rejects(sending, /网络错误/);
+      assert.equal(fake.sendAttempts, 1);
+      assert.equal(fake.sent.length, 0);
+    });
+
+    it("waits longer before each new try", async (t) => {
+      await connectWithMessageToReplyTo(40);
+      const started: number[] = [];
+      const realFetch = globalThis.fetch;
+      t.mock.method(globalThis, "fetch", async (url: string, init?: RequestInit) => {
+        if (String(url).includes("/messages")) {
+          started.push(performance.now());
+          throw networkFailure("ECONNREFUSED");
+        }
+        return realFetch(url, init);
+      });
+      await assert.rejects(reply());
+      assert.equal(started.length, 3);
+      assert.ok(started[1]! - started[0]! >= 35, "about one step");
+      assert.ok(started[2]! - started[1]! >= 75, "about two steps");
+    });
+  });
+});
+
+describe("describing a network error", () => {
+  it("names the code a failed fetch hides in its cause", () => {
+    const error = new TypeError("fetch failed", { cause: Object.assign(new Error("x"), { code: "UND_ERR_CONNECT_TIMEOUT" }) });
+    assert.equal(networkErrorCode(error), "UND_ERR_CONNECT_TIMEOUT");
+    assert.equal(describeNetworkError(error, "QQ"), "网络错误（UND_ERR_CONNECT_TIMEOUT）");
+  });
+
+  it("falls back to the cause's message when it has no code", () => {
+    const error = new TypeError("fetch failed", { cause: new Error("bad port") });
+    assert.equal(describeNetworkError(error, "QQ"), "网络错误（bad port）");
+    assert.equal(networkErrorCode(error), undefined);
+  });
+
+  it("says a timeout was a timeout, on the right platform", () => {
+    const error = new DOMException("aborted", "TimeoutError");
+    assert.equal(describeNetworkError(error, "QQ"), "连接QQ超时");
+    assert.equal(describeNetworkError(error, "微信"), "连接微信超时");
+  });
+
+  it("keeps any other message, including the platform's own errors", () => {
+    assert.equal(describeNetworkError(new Error("QQ 接口错误 400"), "QQ"), "QQ 接口错误 400");
+    assert.equal(describeNetworkError("plain text", "QQ"), "plain text");
+    assert.equal(networkErrorCode("plain text"), undefined);
+    assert.equal(networkErrorCode(new Error("no cause")), undefined);
   });
 });
 
