@@ -96,6 +96,10 @@ export type ChannelView = {
   conversations: ConversationView[];
 };
 
+// Replies drafted for a WeChat work group. They wait for the owner like any held reply, but
+// they'd go out through the WeChat window rather than a channel.
+export const WECHAT_WORK_CHANNEL_ID = "wechat-work";
+
 export type PendingReply = {
   id: string;
   channelId: string;

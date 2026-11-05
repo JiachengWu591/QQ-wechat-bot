@@ -9,8 +9,9 @@ import type { ScreenMention, ScreenScan, WeChatScreen } from "./wx-screen.ts";
 const SCANS_BEFORE_GONE = 3;
 // A name that can't be read now often can be on the next scan, and only then can it be acted on.
 const SCANS_BEFORE_UNREADABLE = 3;
-// With WeChat in front, the owner is using it unless they've left it alone for this long.
-const IN_USE_IDLE_MS = 60_000;
+// With WeChat in front, the owner is using it unless they've left it alone for this long. Reading a
+// long message involves no input, and opening a chat would take it away from them.
+const IN_USE_IDLE_MS = 3 * 60_000;
 // Enough for the conversation around a mention. Four wheel messages move about 250 px of a message
 // area of about 470, which leaves plenty of overlap for the model to line pages up by.
 const READ_PAGES = 3;

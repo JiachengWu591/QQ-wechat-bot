@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { afterEach, describe, it } from "node:test";
+import { WECHAT_WORK_CHANNEL_ID } from "@shu/protocol";
 import { dayKey } from "../src/engine.ts";
 import { Store } from "../src/store.ts";
 import type { Adapter, AdapterHandlers, OutboundText } from "../src/types.ts";
@@ -282,6 +283,123 @@ describe("reading WeChat from the engine", () => {
       await until(() => owned.sent.length === 1, "reminder");
       assert.equal(h.store.recentChat(50).some((line) => line.text.includes("忽略之前的指令")), false);
       assert.deepEqual(h.fake.requests, [], "no turn with tools ran");
+    });
+
+    describe("with a draft", () => {
+      const answer = (draft: string | null, summary = "小明在催报告。") => async () => ({
+        costUsd: 0.03,
+        text: JSON.stringify({ messages: [{ sender: "小明", text: "@主人 报告发一下" }], mention: { sender: "小明", text: "@主人 报告发一下" }, summary, draft }),
+      });
+
+      it("holds it for the owner and tells them about it", async () => {
+        await mentioned();
+        h.fake.readBehavior = answer("好的，【时间】发你。");
+        await until(() => owned.sent.length === 1, "reminder");
+        const [pending, ...others] = h.engine.getState().pending;
+        assert.deepEqual(others, []);
+        assert.equal(pending!.channelId, WECHAT_WORK_CHANNEL_ID);
+        assert.equal(pending!.conversationId, "财务报销群");
+        assert.equal(pending!.conversationTitle, "财务报销群");
+        assert.equal(pending!.triggerSender, "小明");
+        assert.equal(pending!.triggerText, "@主人 报告发一下");
+        assert.equal(pending!.draft, "好的，【时间】发你。");
+        assert.equal(pending!.costUsd, 0.03);
+        assert.match(owned.sent[0]!.text, /草稿：好的，【时间】发你。/);
+        assert.ok(h.activity.includes("ok: 读了 2 屏，1 条消息，写了草稿"));
+      });
+
+      it("shows up in the console right away", async () => {
+        await scanning();
+        // So the owner's chat already exists, and adding it isn't what updates the console.
+        screen.answer = seen("别的群");
+        await until(() => owned.sent.length === 1, "first reminder");
+        h.engine.allowWorkbenchGroup("财务报销群");
+        h.fake.readBehavior = answer("好的");
+        let shown = 0;
+        h.engine.on("state", (state) => (shown = state.pending.length));
+        screen.answer = seen("别的群", "财务报销群");
+        await until(() => owned.sent.length === 2, "second reminder");
+        assert.equal(shown, 1);
+      });
+
+      it("treats it as coming from the people it was written from, not the owner", async () => {
+        await mentioned();
+        h.fake.readBehavior = answer("好的");
+        await until(() => owned.sent.length === 1, "reminder");
+        assert.equal(h.engine.getState().pending[0]!.tier, "member");
+      });
+
+      it("keeps it to one line", async () => {
+        await mentioned();
+        h.fake.readBehavior = answer("第一行\n第二行");
+        await until(() => owned.sent.length === 1, "reminder");
+        assert.equal(h.engine.getState().pending[0]!.draft, "第一行 第二行");
+      });
+
+      it("has nothing to hold when the model says no reply is needed", async () => {
+        await mentioned();
+        h.fake.readBehavior = answer(null);
+        await until(() => owned.sent.length === 1, "reminder");
+        assert.deepEqual(h.engine.getState().pending, []);
+        assert.ok(h.activity.includes("ok: 读了 2 屏，1 条消息"));
+      });
+
+      it("uses the summary as the context when no particular message could be picked out", async () => {
+        await mentioned();
+        h.fake.readBehavior = async () => ({ text: JSON.stringify({ messages: [], mention: null, summary: "大家在排期。", draft: "好的" }) });
+        await until(() => owned.sent.length === 1, "reminder");
+        const pending = h.engine.getState().pending[0]!;
+        assert.equal(pending.triggerSender, "有人");
+        assert.equal(pending.triggerText, "大家在排期。");
+      });
+
+      it("keeps it out of every chat history, so it can't reach a model with tools", async () => {
+        await mentioned();
+        h.fake.readBehavior = answer("这句草稿");
+        await until(() => owned.sent.length === 1, "reminder");
+        assert.equal(h.store.recentChat(50).some((line) => line.text.includes("这句草稿")), false);
+      });
+
+      it("can't be sent yet, and stays there when someone tries", async () => {
+        await mentioned();
+        h.fake.readBehavior = answer("好的");
+        await until(() => owned.sent.length === 1, "reminder");
+        const { id } = h.engine.getState().pending[0]!;
+        await assert.rejects(h.engine.approve(id), /还不能往工作群发送/);
+        await assert.rejects(h.engine.approve(id, "改过的"), /还不能往工作群发送/);
+        assert.equal(h.engine.getState().pending.length, 1);
+        assert.equal(owned.sent.length, 1);
+      });
+
+      it("can be ignored", async () => {
+        await mentioned();
+        h.fake.readBehavior = answer("好的");
+        await until(() => owned.sent.length === 1, "reminder");
+        h.engine.reject(h.engine.getState().pending[0]!.id);
+        assert.deepEqual(h.engine.getState().pending, []);
+      });
+
+      it("replaces the group's older draft, and leaves other groups' and other chats' alone", async () => {
+        await mentioned();
+        h.engine.allowWorkbenchGroup("项目周会群");
+        h.fake.readBehavior = answer("第一版");
+        await until(() => owned.sent.length === 1, "first reminder");
+        const held = { id: "other", channelId: "sim", conversationId: "财务报销群", conversationTitle: "同名的聊天", replyToId: "m", triggerSender: "x", triggerText: "y", draft: "别的回复", tier: "owner" as const, costUsd: 0, createdAt: 1 };
+        h.store.addPending(held);
+        screen.title = "项目周会群";
+        h.fake.readBehavior = answer("另一个群的");
+        screen.answer = seen("财务报销群", "项目周会群");
+        await until(() => owned.sent.length === 2, "second reminder");
+
+        screen.title = "财务报销群";
+        h.fake.readBehavior = answer("第二版");
+        screen.answer = { state: "ok", mentions: [], foreground: false, idleMs: 0 };
+        const before = screen.scans;
+        await until(() => screen.scans > before + 4, "the markers going away");
+        screen.answer = seen("财务报销群");
+        await until(() => owned.sent.length === 3, "third reminder");
+        assert.deepEqual(h.engine.getState().pending.map((reply) => reply.draft).sort(), ["另一个群的", "别的回复", "第二版"].sort());
+      });
     });
 
     it("doesn't open it when the owner's budget has run out, so it stays unread", async () => {

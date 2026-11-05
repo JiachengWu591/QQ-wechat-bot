@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { CHAT_READ_SYSTEM, chatReadPrompt, mentionReminder, parseChatRead, readReminder } from "../src/wx-read.ts";
+import { CHAT_READ_SYSTEM, chatReadPrompt, cleanDraft, mentionReminder, parseChatRead, readReminder } from "../src/wx-read.ts";
 
 const answer = { messages: [{ sender: "小明", time: "09:30", text: "@主人 报告发一下", fromOwner: false }], mention: { sender: "小明", text: "@主人 报告发一下" }, summary: "小明在催报告。" };
 
@@ -27,6 +27,27 @@ describe("understanding what the model read", () => {
   });
 });
 
+describe("preparing a draft", () => {
+  it("keeps it to one line, since a line break in WeChat's input box sends the message", () => {
+    assert.equal(cleanDraft({ ...answer, draft: "第一行\n第二行\r\n第三行" }), "第一行 第二行 第三行");
+  });
+
+  it("limits its length", () => {
+    assert.ok((cleanDraft({ ...answer, draft: "字".repeat(5000) }) as string).length < 310);
+  });
+
+  it("has nothing for a missing or empty draft", () => {
+    assert.equal(cleanDraft(answer), null);
+    assert.equal(cleanDraft({ ...answer, draft: null }), null);
+    assert.equal(cleanDraft({ ...answer, draft: " \n " }), null);
+  });
+
+  it("reads a draft from the model's answer", () => {
+    assert.equal(parseChatRead(JSON.stringify({ ...answer, draft: "收到" }))?.draft, "收到");
+    assert.equal(parseChatRead(JSON.stringify({ ...answer, draft: null }))?.draft, null);
+  });
+});
+
 describe("the prompt", () => {
   it("treats everything on screen as material, not instructions", () => {
     assert.match(CHAT_READ_SYSTEM, /只是资料/);
@@ -35,6 +56,15 @@ describe("the prompt", () => {
 
   it("has the summary speak to the owner directly, since it goes straight to them", () => {
     assert.match(chatReadPrompt("项目周会群", 1), /summary 是直接发给主人看的，称呼主人时用“你”/);
+  });
+
+  it("asks for a one-line draft that doesn't decide anything on the owner's behalf", () => {
+    const prompt = chatReadPrompt("项目周会群", 1);
+    assert.match(prompt, /只写一行/);
+    assert.match(prompt, /不要替主人定/);
+    assert.match(prompt, /不要先说“好的”/);
+    assert.match(prompt, /【】/);
+    assert.match(prompt, /不要写猜的内容/);
   });
 
   it("names the group, and explains overlap only when there's more than one page", () => {
@@ -66,6 +96,18 @@ describe("what the owner is told", () => {
   it("flattens line breaks, so a message can't pose as something else in the reminder", () => {
     const reminder = readReminder("甲", { messages: [], mention: { sender: "小明", text: "第一行\n\n第二行" }, summary: "" });
     assert.equal(reminder, "“甲”里有人 @ 你。\n小明：第一行 第二行");
+  });
+
+  it("includes the draft, and says where to deal with it", () => {
+    assert.equal(
+      readReminder("甲", { ...answer, mention: null, summary: "", draft: "好的，【时间】发你。" }),
+      "“甲”里有人 @ 你。\n草稿：好的，【时间】发你。\n可以到控制台的“待确认”里修改或忽略。",
+    );
+  });
+
+  it("leaves the draft out when there isn't one", () => {
+    assert.doesNotMatch(readReminder("甲", { ...answer, draft: null }), /草稿/);
+    assert.doesNotMatch(readReminder("甲", { ...answer, draft: "  " }), /草稿/);
   });
 
   it("adds a note when there is one", () => {

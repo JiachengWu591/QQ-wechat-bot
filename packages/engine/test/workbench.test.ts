@@ -160,12 +160,16 @@ describe("watching for mentions", () => {
     assert.deepEqual(mentions, [{ group: "项目周会群", allowed: true }]);
   });
 
-  it("says so on the third scan it still can't read a row's name", async () => {
-    start(nothing, seen([]), seen([]));
-    await until(() => screen.scans > 2, "two sightings");
+  it("says nothing about a row it could only not read twice", async () => {
+    start(nothing, seen([]), seen([]), nothing);
+    await until(() => screen.scans > 10, "scans");
     assert.deepEqual(mentions, []);
-    screen.plan = [seen([])];
-    await until(() => mentions.length === 1, "the report");
+  });
+
+  it("says so on the third scan it still can't read a row's name", async () => {
+    start(nothing, seen([]), seen([]), seen([]), nothing);
+    await until(() => screen.scans > 10, "scans");
+    assert.deepEqual(mentions, [{ group: null, allowed: false }]);
   });
 
   it("still acts on a name that only comes through after that", async () => {
@@ -433,13 +437,13 @@ describe("watching for mentions", () => {
 
     it("counts WeChat left in front with nobody there as not in use", async () => {
       allowed = allowedGroup;
-      start(nothing, inWeChat(60_000, ["项目周会群"]));
+      start(nothing, inWeChat(180_000, ["项目周会群"]));
       await until(() => reads.length === 1, "a read");
     });
 
-    it("still counts as in use just under that", async () => {
+    it("still counts as in use just under that, since reading a long message involves no input", async () => {
       allowed = allowedGroup;
-      start(nothing, inWeChat(59_999, ["项目周会群"]));
+      start(nothing, inWeChat(179_999, ["项目周会群"]));
       await until(() => screen.scans > 10, "scans");
       assert.deepEqual(screen.opened, []);
     });

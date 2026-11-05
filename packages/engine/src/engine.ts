@@ -1,7 +1,7 @@
 // The hub: everything a message goes through between arriving and a reply leaving.
 import { EventEmitter } from "node:events";
 import { randomInt, randomUUID } from "node:crypto";
-import { modelOptions } from "@shu/protocol";
+import { modelOptions, WECHAT_WORK_CHANNEL_ID } from "@shu/protocol";
 import type {
   AccessEntry,
   ActivityEntry,
@@ -29,7 +29,7 @@ import type { LocalTool, ToolContext } from "./tools.ts";
 import type { Adapter, AdapterConversation, AdapterMessage } from "./types.ts";
 import { confusableGroup, normalizeGroupName, Workbench, type ChatReading, type WorkbenchMention } from "./workbench.ts";
 import type { Workspace } from "./workspace.ts";
-import { CHAT_READ_SYSTEM, chatReadPrompt, mentionReminder, parseChatRead, readReminder } from "./wx-read.ts";
+import { CHAT_READ_SYSTEM, chatReadPrompt, cleanDraft, mentionReminder, parseChatRead, readReminder, type ChatRead } from "./wx-read.ts";
 import type { WeChatScreen } from "./wx-screen.ts";
 
 export type EngineConfig = {
@@ -331,13 +331,40 @@ export class Engine extends EventEmitter<EngineEvents> {
         this.#log("error", "读了内容，但结果看不懂", group, result.costUsd);
         return await this.#remindOwner(mentionReminder(group, "内容没读出来，请自己看一下。"));
       }
-      this.#log("ok", `读了 ${images.length} 屏${reachedTop ? "（已到顶）" : ""}，${read.messages.length} 条消息`, group, result.costUsd);
+      const drafted = this.#holdWorkDraft(group, read, result.costUsd);
+      this.#log("ok", `读了 ${images.length} 屏${reachedTop ? "（已到顶）" : ""}，${read.messages.length} 条消息${drafted ? "，写了草稿" : ""}`, group, result.costUsd);
       await this.#remindOwner(readReminder(group, read));
     } catch (error) {
       if (signal.aborted) return;
       this.#log("error", `读内容时出错：${error instanceof Error ? error.message : String(error)}`, group);
       await this.#remindOwner(mentionReminder(group, "内容没读出来，请自己看一下。"));
     }
+  }
+
+  // The newest draft replaces an older one for the same group, which answered a conversation that
+  // has since moved on.
+  #holdWorkDraft(group: string, read: ChatRead, costUsd: number): boolean {
+    const draft = cleanDraft(read);
+    if (!draft) return false;
+    for (const reply of this.#store.listPending()) {
+      if (reply.channelId === WECHAT_WORK_CHANNEL_ID && reply.conversationId === group) this.#store.removePending(reply.id);
+    }
+    this.#store.addPending({
+      id: randomUUID(),
+      channelId: WECHAT_WORK_CHANNEL_ID,
+      conversationId: group,
+      conversationTitle: group,
+      replyToId: "",
+      triggerSender: read.mention?.sender ?? "有人",
+      triggerText: read.mention?.text ?? read.summary,
+      draft,
+      // Written from what other people said, so it can't count as more than that.
+      tier: "member",
+      costUsd,
+      createdAt: this.#now(),
+    });
+    this.#emitState();
+    return true;
   }
 
   // Not recorded as part of the conversation. A group's name is whatever someone else typed, and
@@ -568,6 +595,7 @@ export class Engine extends EventEmitter<EngineEvents> {
   async approve(pendingId: string, editedText?: string) {
     const reply = this.#store.listPending().find((entry) => entry.id === pendingId);
     if (!reply) throw new Error("这条待确认的回复已经不存在了。");
+    if (reply.channelId === WECHAT_WORK_CHANNEL_ID) throw new Error("这一版还不能往工作群发送，可以复制草稿自己发。");
     if (!this.#canSend(reply.channelId, reply.conversationId)) {
       throw new Error("总闸或这个聊天已关闭，打开后才能发送。");
     }

@@ -52,7 +52,7 @@ export function WorkbenchPanel({ engine, state }: { engine: EngineApi; state: En
       {status.detail ? <p className={status.state === "error" ? "form-error" : "panel-meta"}>{status.detail}</p> : null}
 
       <h3 className="subheading">允许的群</h3>
-      <p className="panel-meta">这里的群有人 @ 你时，会被点开并标成已读，聊天区截图会发给 Claude 读内容，费用算在“我的工作”里。其他群只提醒，不会被点开。</p>
+      <p className="panel-meta">这里的群有人 @ 你时，会被点开并标成已读，聊天区截图会发给 Claude 读内容并写回复草稿，费用算在“我的工作”里。其他群只提醒，不会被点开。</p>
       {allowedGroups.length ? (
         <ul className="rows">
           {allowedGroups.map((group) => (
