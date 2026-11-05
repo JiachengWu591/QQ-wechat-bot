@@ -1,6 +1,7 @@
 // The model behind the bot. Chat goes straight to the Claude API with an explicit tool
 // list, so a turn can only ever reach the tools the engine chose to offer it.
 import Anthropic from "@anthropic-ai/sdk";
+import type { ImagePart } from "./images.ts";
 import type { ToolInputSchema } from "./tools.ts";
 
 export type BrainTool = { name: string; description: string; inputSchema: ToolInputSchema };
@@ -36,10 +37,23 @@ export type BrainResult = {
   truncated: boolean;
 };
 
+export type BrainReadRequest = {
+  model: string;
+  system: string;
+  text: string;
+  images: ImagePart[];
+  signal: AbortSignal;
+  onCost(costUsd: number): void;
+};
+
+export type BrainReadResult = { text: string; model: string; costUsd: number; refused: boolean; truncated: boolean };
+
 export interface Brain {
   // The model to use until the owner chooses another.
   readonly model: string;
   reply(request: BrainRequest): Promise<BrainResult>;
+  // For what other people wrote. One call with no tools at all, so nothing in it can get anything done.
+  read(request: BrainReadRequest): Promise<BrainReadResult>;
 }
 
 // USD per million tokens, from the pricing page. Check it when models change. Cache writes are
@@ -203,5 +217,34 @@ export class ApiBrain implements Brain {
       };
     }
     throw new Error(`The model didn't finish within ${profile.maxRounds} rounds of tool calls.`);
+  }
+
+  async read(request: BrainReadRequest): Promise<BrainReadResult> {
+    const images = request.images.map((image) => ({
+      type: "image" as const,
+      source: { type: "base64" as const, media_type: image.mediaType, data: image.data.toString("base64") },
+    }));
+    const response = await this.#client.beta.messages
+      .stream(
+        {
+          model: request.model,
+          max_tokens: profiles.chat.maxTokens,
+          ...(MODELS_WITHOUT_FALLBACK.has(request.model) ? {} : { betas: ["server-side-fallback-2026-07-01"], fallbacks: "default" as const }),
+          output_config: { effort: profiles.chat.effort },
+          system: request.system,
+          messages: [{ role: "user", content: [...images, { type: "text", text: request.text }] }],
+        },
+        { signal: request.signal },
+      )
+      .finalMessage();
+    const costUsd = tokenCost(response.model, response.usage);
+    request.onCost(costUsd);
+    return {
+      text: response.content.flatMap((block) => (block.type === "text" ? [block.text] : [])).join(""),
+      model: response.model,
+      costUsd,
+      refused: response.stop_reason === "refusal",
+      truncated: response.stop_reason === "max_tokens",
+    };
   }
 }

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import Anthropic from "@anthropic-ai/sdk";
-import { ApiBrain, tokenCost, type BrainRequest, type ToolOutcome } from "../src/brain.ts";
+import { ApiBrain, tokenCost, type BrainReadRequest, type BrainRequest, type ToolOutcome } from "../src/brain.ts";
 
 const MODEL = "claude-opus-5-5";
 const GATE = "request_web_search";
@@ -57,6 +57,66 @@ function request(overrides: Partial<BrainRequest> = {}): BrainRequest {
 }
 
 const toolNames = (call: { params: any }) => (call.params.tools ?? []).map((tool: any) => tool.name);
+
+describe("reading images", () => {
+  const readRequest = (overrides: Partial<BrainReadRequest> = {}): BrainReadRequest => ({
+    model: MODEL,
+    system: "system",
+    text: "读这些",
+    images: [
+      { mediaType: "image/png", data: Buffer.from("first") },
+      { mediaType: "image/png", data: Buffer.from("second") },
+    ],
+    signal: new AbortController().signal,
+    onCost: () => {},
+    ...overrides,
+  });
+
+  it("sends the images in order, then the instruction, and gives back the text", async () => {
+    const { client, calls } = fakeClient([say("读到了")]);
+    const result = await new ApiBrain({ apiKey: "k", model: MODEL, client }).read(readRequest());
+    const content = calls[0]!.params.messages[0].content;
+    assert.equal(content[0].source.data, Buffer.from("first").toString("base64"));
+    assert.equal(content[0].source.media_type, "image/png");
+    assert.equal(content[1].source.data, Buffer.from("second").toString("base64"));
+    assert.deepEqual(content[2], { type: "text", text: "读这些" });
+    assert.equal(calls[0]!.params.system, "system");
+    assert.equal(result.text, "读到了");
+  });
+
+  it("offers no tools at all, because everything in the images came from someone else", async () => {
+    const { client, calls } = fakeClient([say("读到了")]);
+    await new ApiBrain({ apiKey: "k", model: MODEL, client }).read(readRequest());
+    assert.equal("tools" in calls[0]!.params, false);
+    assert.equal(calls.length, 1);
+  });
+
+  it("reports the cost and can be aborted", async () => {
+    const { client, calls } = fakeClient([say("读到了")]);
+    const controller = new AbortController();
+    const costs: number[] = [];
+    const result = await new ApiBrain({ apiKey: "k", model: MODEL, client }).read(readRequest({ signal: controller.signal, onCost: (cost) => costs.push(cost) }));
+    assert.deepEqual(costs, [result.costUsd]);
+    assert.ok(result.costUsd > 0);
+    assert.equal(calls[0]!.options.signal, controller.signal);
+  });
+
+  it("says when the model refused or ran out of room", async () => {
+    const brain = () => new ApiBrain({ apiKey: "k", model: MODEL, client: fakeClient([say("", "refusal")]).client });
+    assert.equal((await brain().read(readRequest())).refused, true);
+    const cut = new ApiBrain({ apiKey: "k", model: MODEL, client: fakeClient([say("半截", "max_tokens")]).client });
+    assert.equal((await cut.read(readRequest())).truncated, true);
+  });
+
+  it("asks for a fallback model, except from a model that has none", async () => {
+    const opus = fakeClient([say("x")]);
+    await new ApiBrain({ apiKey: "k", model: MODEL, client: opus.client }).read(readRequest());
+    assert.equal(opus.calls[0]!.params.fallbacks, "default");
+    const haiku = fakeClient([say("x")]);
+    await new ApiBrain({ apiKey: "k", model: MODEL, client: haiku.client }).read(readRequest({ model: "claude-haiku-5-5" }));
+    assert.equal("fallbacks" in haiku.calls[0]!.params, false);
+  });
+});
 
 describe("what each model costs, per the pricing page", () => {
   const close = (actual: number, expected: number) => assert.ok(Math.abs(actual - expected) < 1e-9, `${actual} is not ${expected}`);

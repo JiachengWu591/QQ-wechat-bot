@@ -5,6 +5,7 @@ import { ActivityRow, autonomyLabels, formatCost, Switch } from "../ui.tsx";
 import type { EngineApi } from "../useEngine.ts";
 import { AccessPanel } from "./AccessPanel.tsx";
 import { LoginPanel } from "./LoginPanel.tsx";
+import { WorkbenchPanel } from "./WorkbenchPanel.tsx";
 
 const autonomyOptions: Autonomy[] = ["notify", "confirm", "auto"];
 
@@ -195,6 +196,8 @@ export function OverviewPage({ engine, state, onOpenActivity }: { engine: Engine
           )}
         </section>
       ))}
+
+      <WorkbenchPanel engine={engine} state={state} />
 
       <AccessPanel engine={engine} state={state} />
 

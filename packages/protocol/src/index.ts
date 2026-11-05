@@ -126,9 +126,25 @@ export type PairingView = {
   expiresAt: number;
 };
 
+// Reading the WeChat window for mentions in work groups.
+export type WorkbenchStatus = {
+  state: "off" | "scanning" | "paused" | "error";
+  detail?: string;
+};
+
+export type WorkbenchView = {
+  // Its own switch, off by default, because it reads the screen.
+  enabled: boolean;
+  status: WorkbenchStatus;
+  allowedGroups: string[];
+  intervalSeconds: number;
+};
+
 export type EngineState = {
   running: boolean;
   channels: ChannelView[];
+  // Null where the screen can't be read, such as outside Windows.
+  workbench: WorkbenchView | null;
   pending: PendingReply[];
   usage: {
     todayUsd: number;
@@ -169,6 +185,9 @@ export const commandSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("pairing.start"), channelId: id, tier: z.enum(grantedTiers) }),
   z.object({ type: z.literal("pairing.cancel") }),
   z.object({ type: z.literal("access.remove"), channelId: id, senderId: id }),
+  z.object({ type: z.literal("workbench.setEnabled"), enabled: z.boolean() }),
+  z.object({ type: z.literal("workbench.allowGroup"), name: z.string().trim().min(1).max(60) }),
+  z.object({ type: z.literal("workbench.removeGroup"), name: z.string().min(1).max(60) }),
   z.object({
     type: z.literal("sim.send"),
     conversationId: id,

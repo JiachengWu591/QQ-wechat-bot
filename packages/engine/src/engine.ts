@@ -18,6 +18,8 @@ import type {
   PendingReply,
   SimSender,
   Tier,
+  WorkbenchStatus,
+  WorkbenchView,
 } from "@shu/protocol";
 import type { Brain, ToolOutcome } from "./brain.ts";
 import { atLeast, effectiveTier, RateLimiter, tierOf, type AccessList } from "./policy.ts";
@@ -25,7 +27,10 @@ import { chatPrompt, systemPrompt } from "./prompt.ts";
 import type { BudgetLane, Store } from "./store.ts";
 import type { LocalTool, ToolContext } from "./tools.ts";
 import type { Adapter, AdapterConversation, AdapterMessage } from "./types.ts";
+import { confusableGroup, normalizeGroupName, Workbench, type ChatReading, type WorkbenchMention } from "./workbench.ts";
 import type { Workspace } from "./workspace.ts";
+import { CHAT_READ_SYSTEM, chatReadPrompt, mentionReminder, parseChatRead, readReminder } from "./wx-read.ts";
+import type { WeChatScreen } from "./wx-screen.ts";
 
 export type EngineConfig = {
   botName: string;
@@ -113,6 +118,9 @@ export class Engine extends EventEmitter<EngineEvents> {
   // Bumped by a cancel, so that turns still waiting in the queue don't start afterwards.
   #turnEpochs = new Map<string, number>();
   #pairing: Pairing | null = null;
+  #workbench: Workbench | null = null;
+  #workbenchStatus: WorkbenchStatus = { state: "off" };
+  #workbenchIntervalMs = 0;
 
   constructor(deps: {
     store: Store;
@@ -121,6 +129,7 @@ export class Engine extends EventEmitter<EngineEvents> {
     tools: LocalTool[];
     workspace: Workspace;
     config: EngineConfig;
+    workbench?: { screen: WeChatScreen; intervalMs: number };
     now?: () => number;
   }) {
     super();
@@ -135,6 +144,22 @@ export class Engine extends EventEmitter<EngineEvents> {
     this.#conversationLimit = new RateLimiter(deps.config.perConversationPerMinute, 60_000);
     for (const adapter of deps.adapters) {
       this.#channelEnabled.set(adapter.id, this.#store.getSetting<boolean>(`channel:${adapter.id}:enabled`) ?? true);
+    }
+    if (deps.workbench) {
+      this.#workbenchIntervalMs = deps.workbench.intervalMs;
+      this.#workbench = new Workbench({
+        ...deps.workbench,
+        allowedGroups: () => this.#allowedGroups(),
+        onMention: (mention) => this.#onWorkbenchMention(mention),
+        onRead: (reading) => this.#readWorkChat(reading),
+        onReadFailed: (group, reason) => {
+          this.#log("error", reason, group);
+          void this.#remindOwner(mentionReminder(group, reason));
+        },
+        onDropped: (group) => this.#log("info", "你已经点开看了，不再读取", group),
+        onExisting: (count) => this.#log("info", `读取开始时已有 ${count} 个未读的 @，不提醒`),
+        onStatus: (status) => this.#onWorkbenchStatus(status),
+      });
     }
   }
 
@@ -155,6 +180,7 @@ export class Engine extends EventEmitter<EngineEvents> {
           return { id: conversation.id, kind: conversation.kind, title: title ?? conversation.title, ...settings };
         }),
       })),
+      workbench: this.#workbenchView(),
       pending: this.#store.listPending(),
       usage: {
         todayUsd: this.#store.costForDay(today),
@@ -184,6 +210,7 @@ export class Engine extends EventEmitter<EngineEvents> {
       this.#acceptSince.set(id, now);
       if (this.#channelEnabled.get(id)) await this.#startAdapter(adapter);
     }
+    if (this.#workbenchEnabled()) this.#workbench?.start();
     this.#log("info", "已启动，只处理从现在开始的新消息");
     this.#emitState();
   }
@@ -197,8 +224,138 @@ export class Engine extends EventEmitter<EngineEvents> {
     for (const controller of this.#inFlight.keys()) controller.abort();
     this.#log("info", "已停止，进行中的任务已中止");
     this.#emitState();
-    await Promise.allSettled([...this.#adapters.values()].map((adapter) => adapter.stop()));
+    await Promise.allSettled([...[...this.#adapters.values()].map((adapter) => adapter.stop()), this.#workbench?.stop()]);
     this.#emitState();
+  }
+
+  #workbenchEnabled(): boolean {
+    return this.#store.getSetting<boolean>("workbench:enabled") ?? false;
+  }
+
+  #allowedGroups(): string[] {
+    return this.#store.getSetting<string[]>("workbench:allowedGroups") ?? [];
+  }
+
+  #workbenchView(): WorkbenchView | null {
+    if (!this.#workbench) return null;
+    return {
+      enabled: this.#workbenchEnabled(),
+      status: this.#workbenchStatus,
+      allowedGroups: this.#allowedGroups(),
+      intervalSeconds: Math.round(this.#workbenchIntervalMs / 1000),
+    };
+  }
+
+  async setWorkbenchEnabled(enabled: boolean) {
+    if (!this.#workbench) throw new Error("这台电脑上读取不了微信窗口。");
+    this.#store.setSetting("workbench:enabled", enabled);
+    if (enabled && this.#running) this.#workbench.start();
+    if (!enabled) await this.#workbench.stop();
+    this.#log("info", `已${enabled ? "打开" : "关闭"}微信工作群读取`);
+    this.#emitState();
+  }
+
+  allowWorkbenchGroup(name: string) {
+    const normalized = normalizeGroupName(name);
+    const allowed = this.#allowedGroups();
+    if (allowed.includes(normalized)) return;
+    // One character is too little to tell a chat by, on a screen read that gets characters wrong.
+    if (normalized.length < 2) throw new Error("群名至少要两个字。");
+    const other = confusableGroup(normalized, allowed);
+    if (other) throw new Error(`“${normalized}”和“${other}”只差一个字，屏幕识别可能把它们读混，不能同时允许。`);
+    this.#store.setSetting("workbench:allowedGroups", [...allowed, normalized]);
+    this.#log("info", "已允许读取这个群", normalized);
+    this.#emitState();
+  }
+
+  removeWorkbenchGroup(name: string) {
+    this.#store.setSetting("workbench:allowedGroups", this.#allowedGroups().filter((group) => group !== name));
+    this.#log("info", "已不再允许读取这个群", name);
+    this.#emitState();
+  }
+
+  // Only when it changes, or a failing read would add a line to the log on every scan.
+  #onWorkbenchStatus(status: WorkbenchStatus) {
+    const previous = this.#workbenchStatus;
+    this.#workbenchStatus = status;
+    if (previous.state === status.state && previous.detail === status.detail) return;
+    if (status.detail) this.#log(status.state === "error" ? "error" : "info", status.detail);
+    this.#emitState();
+  }
+
+  // True to have the chat opened and read. Without a way to read it, opening it would only mark it
+  // as read, so it stays unread for the owner.
+  #onWorkbenchMention({ group, allowed }: WorkbenchMention): boolean {
+    if (group === null) {
+      this.#log("info", "有人 @ 你，但没读清是哪个群");
+      void this.#remindOwner("有个群里有人 @ 你，群名没读清楚。");
+      return false;
+    }
+    if (!allowed) {
+      this.#log("info", "有人 @ 你，这个群不在允许列表里", group);
+      void this.#remindOwner(mentionReminder(group));
+      return false;
+    }
+    const obstacle = !this.#brain
+      ? "还没有配置 API key，没有读内容。"
+      : this.#store.costForDay(dayKey(this.#now()), "owner") >= this.#config.ownerDailyLimitUsd
+        ? `今日工作预算 $${this.#config.ownerDailyLimitUsd} 已用完，没有读内容。`
+        : null;
+    if (obstacle) {
+      this.#log("blocked", `有人 @ 你。${obstacle}`, group);
+      void this.#remindOwner(mentionReminder(group, obstacle));
+      return false;
+    }
+    this.#log("info", "有人 @ 你，准备读取", group);
+    return true;
+  }
+
+  async #readWorkChat({ group, images, reachedTop, signal }: ChatReading) {
+    const brain = this.#brain;
+    if (!brain) return;
+    const today = dayKey(this.#now());
+    try {
+      const result = await brain.read({
+        model: this.#selectedModel() ?? brain.model,
+        system: CHAT_READ_SYSTEM,
+        text: chatReadPrompt(group, images.length),
+        images: images.map((data) => ({ mediaType: "image/png", data })),
+        signal,
+        onCost: (costUsd) => {
+          this.#store.addCost(today, costUsd, "owner");
+          this.#emitState();
+        },
+      });
+      const read = result.refused ? null : parseChatRead(result.text);
+      if (!read) {
+        this.#log("error", "读了内容，但结果看不懂", group, result.costUsd);
+        return await this.#remindOwner(mentionReminder(group, "内容没读出来，请自己看一下。"));
+      }
+      this.#log("ok", `读了 ${images.length} 屏${reachedTop ? "（已到顶）" : ""}，${read.messages.length} 条消息`, group, result.costUsd);
+      await this.#remindOwner(readReminder(group, read));
+    } catch (error) {
+      if (signal.aborted) return;
+      this.#log("error", `读内容时出错：${error instanceof Error ? error.message : String(error)}`, group);
+      await this.#remindOwner(mentionReminder(group, "内容没读出来，请自己看一下。"));
+    }
+  }
+
+  // Not recorded as part of the conversation. A group's name is whatever someone else typed, and
+  // the model reads the conversation with the owner's authority, so it must never see this.
+  async #remindOwner(text: string) {
+    for (const adapter of this.#adapters.values()) {
+      const conversationId = adapter.ownerId?.();
+      if (!conversationId) continue;
+      const channelId = adapter.id;
+      try {
+        const conversation = this.#ensureConversation({ channelId, conversationId, conversationKind: "dm", conversationTitle: `我的${adapter.name}` });
+        if (!this.#canSend(channelId, conversationId)) return;
+        await adapter.send({ channelId, conversationId, conversationKind: conversation.kind, text });
+      } catch (error) {
+        this.#log("error", `提醒发送失败：${error instanceof Error ? error.message : String(error)}`);
+      }
+      return;
+    }
   }
 
   async setChannelEnabled(channelId: string, enabled: boolean) {
@@ -752,7 +909,7 @@ export class Engine extends EventEmitter<EngineEvents> {
 
   // Groups start closed: the bot could be added to one the owner has never heard of, and
   // an open group spends money. Private chats are already limited to granted identities.
-  #ensureConversation(message: InboundMessage): AdapterConversation {
+  #ensureConversation(message: Pick<InboundMessage, "channelId" | "conversationId" | "conversationKind" | "conversationTitle">): AdapterConversation {
     const known = this.#knownConversations(message.channelId).find((entry) => entry.id === message.conversationId);
     if (known) return known;
     const isGroup = message.conversationKind === "group";

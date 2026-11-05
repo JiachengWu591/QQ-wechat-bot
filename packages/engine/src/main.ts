@@ -12,6 +12,7 @@ import { currentTimeTool } from "./tools.ts";
 import type { Adapter } from "./types.ts";
 import { fileSessionStore, WeChatAdapter } from "./wechat.ts";
 import { Workspace, workspaceTools } from "./workspace.ts";
+import { WxHelperScreen } from "./wx-screen.ts";
 
 const token = process.env.SHU_ENGINE_TOKEN;
 if (!token) {
@@ -44,6 +45,8 @@ const engine = new Engine({
   adapters,
   workspace,
   tools: [currentTimeTool, ...workspaceTools(workspace)],
+  // Available here, but off until the owner turns it on in the console.
+  ...(process.platform === "win32" ? { workbench: { screen: new WxHelperScreen(), intervalMs: Number(process.env.SHU_WECHAT_SCAN_SECONDS ?? 15) * 1000 } } : {}),
   config: {
     botName: process.env.SHU_BOT_NAME ?? "枢",
     access: {

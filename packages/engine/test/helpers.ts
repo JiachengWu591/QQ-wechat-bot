@@ -1,13 +1,14 @@
 import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { Brain, BrainRequest, BrainResult } from "../src/brain.ts";
+import type { Brain, BrainReadRequest, BrainReadResult, BrainRequest, BrainResult } from "../src/brain.ts";
 import { Engine, type EngineConfig } from "../src/engine.ts";
 import { SIM_CHANNEL_ID, SimAdapter, simConversations, simSenders } from "../src/sim.ts";
 import { Store } from "../src/store.ts";
 import type { LocalTool } from "../src/tools.ts";
-import type { AdapterMessage } from "../src/types.ts";
+import type { Adapter, AdapterMessage } from "../src/types.ts";
 import { Workspace } from "../src/workspace.ts";
+import type { WeChatScreen } from "../src/wx-screen.ts";
 
 export const OWNER = "sim-owner";
 export const TRUSTED = "sim-trusted";
@@ -29,11 +30,26 @@ export class FakeBrain implements Brain {
     request.onCost(costUsd);
     return { text: "", model: this.model, webSearches: 0, refused: false, truncated: false, ...result, costUsd };
   }
+
+  reads: BrainReadRequest[] = [];
+  readBehavior: (request: BrainReadRequest) => Promise<Partial<BrainReadResult>> = async () => ({
+    text: JSON.stringify({ messages: [{ sender: "小明", text: "@主人 报告发一下" }], mention: { sender: "小明", text: "@主人 报告发一下" }, summary: "小明在催报告。" }),
+  });
+
+  async read(request: BrainReadRequest): Promise<BrainReadResult> {
+    this.reads.push(request);
+    const result = await this.readBehavior(request);
+    const costUsd = result.costUsd ?? 0.02;
+    request.onCost(costUsd);
+    return { text: "", model: this.model, refused: false, truncated: false, ...result, costUsd };
+  }
 }
 
 export type Harness = ReturnType<typeof harness>;
 
-export function harness(options: { config?: Partial<EngineConfig>; brain?: Brain | null; tools?: LocalTool[]; store?: Store } = {}) {
+export function harness(
+  options: { config?: Partial<EngineConfig>; brain?: Brain | null; tools?: LocalTool[]; store?: Store; screen?: WeChatScreen; adapters?: Adapter[] } = {},
+) {
   const store = options.store ?? new Store(":memory:");
   const fake = new FakeBrain();
   const adapter = new SimAdapter();
@@ -86,10 +102,11 @@ export function harness(options: { config?: Partial<EngineConfig>; brain?: Brain
   const engine = new Engine({
     store,
     brain: options.brain === undefined ? fake : options.brain,
-    adapters: [adapter],
+    adapters: [adapter, ...(options.adapters ?? [])],
     tools,
     workspace,
     config,
+    ...(options.screen ? { workbench: { screen: options.screen, intervalMs: 1 } } : {}),
     now: () => clock,
   });
   const activity: string[] = [];

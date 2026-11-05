@@ -83,6 +83,12 @@ export function startServer(options: ServerOptions): Promise<{ port: number; clo
         return engine.cancelPairing();
       case "access.remove":
         return engine.removeAccess(command.channelId, command.senderId);
+      case "workbench.setEnabled":
+        return engine.setWorkbenchEnabled(command.enabled);
+      case "workbench.allowGroup":
+        return engine.allowWorkbenchGroup(command.name);
+      case "workbench.removeGroup":
+        return engine.removeWorkbenchGroup(command.name);
       case "sim.send": {
         const conversation = simConversations.find((entry) => entry.id === command.conversationId);
         if (!conversation) throw new Error("没有这个模拟聊天。");

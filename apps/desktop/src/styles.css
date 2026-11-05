@@ -561,6 +561,27 @@ textarea {
   font-size: 13px;
 }
 
+.subheading {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.form-error {
+  color: var(--danger);
+  font-size: 12px;
+}
+
+.group-form {
+  display: flex;
+  gap: 8px;
+}
+
+.group-form .title-input {
+  flex: 1;
+  padding: 4px 8px;
+}
+
 /* Banners and buttons */
 .banner {
   display: flex;
