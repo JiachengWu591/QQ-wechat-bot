@@ -8,8 +8,10 @@ import { QqAdapter } from "./qq.ts";
 import { startServer } from "./server.ts";
 import { SIM_CHANNEL_ID, SimAdapter, simSenders } from "./sim.ts";
 import { Store } from "./store.ts";
-import { defaultTools } from "./tools.ts";
+import { currentTimeTool } from "./tools.ts";
 import type { Adapter } from "./types.ts";
+import { fileSessionStore, WeChatAdapter } from "./wechat.ts";
+import { Workspace, workspaceTools } from "./workspace.ts";
 
 const token = process.env.SHU_ENGINE_TOKEN;
 if (!token) {
@@ -24,17 +26,24 @@ const store = new Store(join(dataDir, "shu.db"));
 const apiKey = process.env.SHU_ANTHROPIC_API_KEY;
 const brain = apiKey ? new ApiBrain({ apiKey, model: process.env.SHU_MODEL ?? "claude-opus-5-5" }) : null;
 
+// Lets a second copy run for testing without taking over the first one's QQ connection.
+const channels = new Set((process.env.SHU_CHANNELS ?? "qq,wechat,sim").split(",").map((channel) => channel.trim()));
+
 const { SHU_QQ_APP_ID: qqAppId, SHU_QQ_APP_SECRET: qqAppSecret } = process.env;
 const adapters: Adapter[] = [
-  ...(qqAppId && qqAppSecret ? [new QqAdapter({ appId: qqAppId, appSecret: qqAppSecret })] : []),
-  new SimAdapter(),
+  ...(channels.has("qq") && qqAppId && qqAppSecret ? [new QqAdapter({ appId: qqAppId, appSecret: qqAppSecret })] : []),
+  ...(channels.has("wechat") ? [new WeChatAdapter({ sessionStore: fileSessionStore(join(dataDir, "wechat-session.json")) })] : []),
+  ...(channels.has("sim") ? [new SimAdapter()] : []),
 ];
+
+const workspace = new Workspace(join(dataDir, "workspace"));
 
 const engine = new Engine({
   store,
   brain,
   adapters,
-  tools: defaultTools(join(dataDir, "workspace")),
+  workspace,
+  tools: [currentTimeTool, ...workspaceTools(workspace)],
   config: {
     botName: process.env.SHU_BOT_NAME ?? "枢",
     access: {
@@ -42,6 +51,9 @@ const engine = new Engine({
       trusted: simSenders.filter((sender) => sender.tier === "trusted").map((sender) => ({ channelId: SIM_CHANNEL_ID, senderId: sender.id })),
     },
     dailyLimitUsd: Number(process.env.SHU_DAILY_LIMIT_USD ?? 3),
+    ownerDailyLimitUsd: Number(process.env.SHU_OWNER_DAILY_LIMIT_USD ?? 5),
+    taskAckMs: 20_000,
+    fileSettleMs: 5000,
     webSearch: process.env.SHU_WEB_SEARCH !== "off",
     sharedSearchesPerDay: Number(process.env.SHU_SHARED_SEARCHES_PER_DAY ?? 10),
     contextMessages: 30,

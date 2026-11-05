@@ -61,6 +61,35 @@ describe("local server", () => {
     client.socket.terminate();
   });
 
+  it("passes login commands on to the channel, tidying the code", async () => {
+    const calls: string[] = [];
+    Object.defineProperties(h.adapter, {
+      beginLogin: { value: async () => void calls.push("begin"), configurable: true },
+      submitLoginCode: { value: (code: string) => void calls.push(`code:${code}`), configurable: true },
+      logout: { value: async () => void calls.push("logout"), configurable: true },
+    });
+    await h.engine.start();
+    const client = connect(server.port, { origin: ORIGIN });
+    await client.opened;
+    client.socket.send(JSON.stringify({ type: "channel.login", channelId: "sim" }));
+    client.socket.send(JSON.stringify({ type: "channel.loginCode", channelId: "sim", code: " 1234 " }));
+    client.socket.send(JSON.stringify({ type: "channel.logout", channelId: "sim" }));
+    await waitFor(() => calls.length === 3);
+    assert.deepEqual(calls, ["begin", "code:1234", "logout"]);
+    client.socket.terminate();
+  });
+
+  it("switches the model, and refuses one that isn't offered", async () => {
+    const client = connect(server.port, { origin: ORIGIN });
+    await client.opened;
+    client.socket.send(JSON.stringify({ type: "brain.setModel", model: "claude-haiku-5-5" }));
+    await waitFor(() => client.events.some((event) => event.type === "state" && event.state.brain.model === "claude-haiku-5-5"));
+    client.socket.send(JSON.stringify({ type: "brain.setModel", model: "gpt-5" }));
+    await waitFor(() => client.events.some((event) => event.type === "error"));
+    assert.equal(h.engine.getState().brain.model, "claude-haiku-5-5");
+    client.socket.terminate();
+  });
+
   it("answers a malformed command with an error instead of crashing", async () => {
     const client = connect(server.port, { origin: ORIGIN });
     await client.opened;

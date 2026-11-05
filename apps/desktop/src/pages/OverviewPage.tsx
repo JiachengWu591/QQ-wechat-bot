@@ -1,9 +1,10 @@
 import { useState } from "react";
 import { Pencil } from "lucide-react";
-import type { Autonomy, ChannelStatus, ChannelView, ConversationView, EngineState } from "@shu/protocol";
+import { modelOptions, type Autonomy, type ChannelStatus, type ChannelView, type ConversationView, type EngineState, type ModelId } from "@shu/protocol";
 import { ActivityRow, autonomyLabels, formatCost, Switch } from "../ui.tsx";
 import type { EngineApi } from "../useEngine.ts";
 import { AccessPanel } from "./AccessPanel.tsx";
+import { LoginPanel } from "./LoginPanel.tsx";
 
 const autonomyOptions: Autonomy[] = ["notify", "confirm", "auto"];
 
@@ -12,7 +13,25 @@ const statusLabels: Record<ChannelStatus["state"], string> = {
   connecting: "连接中",
   connected: "已连接",
   error: "连接失败",
+  "needs-login": "未登录",
 };
+
+function Spending({ label, usedUsd, limitUsd }: { label: string; usedUsd: number; limitUsd: number }) {
+  const usedPercent = Math.min(100, (usedUsd / limitUsd) * 100);
+  return (
+    <div className="spending">
+      <p className="meter-label">
+        <span>{label}</span>
+        <span>
+          {formatCost(usedUsd)} / ${limitUsd}
+        </span>
+      </p>
+      <div className="meter" role="img" aria-label={`${label}今日已用 ${formatCost(usedUsd)}，上限 $${limitUsd}`}>
+        <span className={`meter-fill${usedPercent >= 100 ? " meter-full" : ""}`} style={{ width: `${usedPercent}%` }} />
+      </div>
+    </div>
+  );
+}
 
 function ConversationRow({ engine, channel, conversation }: { engine: EngineApi; channel: ChannelView; conversation: ConversationView }) {
   const [editing, setEditing] = useState(false);
@@ -88,8 +107,9 @@ function ConversationRow({ engine, channel, conversation }: { engine: EngineApi;
 }
 
 export function OverviewPage({ engine, state, onOpenActivity }: { engine: EngineApi; state: EngineState; onOpenActivity(): void }) {
-  const { todayUsd, dailyLimitUsd, searchesToday, searchLimit } = state.usage;
-  const usedPercent = Math.min(100, (todayUsd / dailyLimitUsd) * 100);
+  const { todayUsd, dailyLimitUsd, ownerTodayUsd, ownerDailyLimitUsd, searchesToday, searchLimit } = state.usage;
+  // A channel waiting to be signed in does nothing until someone acts, so it goes up top.
+  const needsAttention = (channel: ChannelView) => channel.canLogin && (channel.login !== undefined || channel.status.state === "needs-login");
 
   return (
     <>
@@ -110,16 +130,35 @@ export function OverviewPage({ engine, state, onOpenActivity }: { engine: Engine
         <div className="banner banner-warn">还没有配置 API key，bot 收到消息也无法回复。</div>
       ) : null}
 
+      {state.channels.filter(needsAttention).map((channel) => (
+        <section className="panel panel-attention" key={channel.id}>
+          <h2>登录{channel.name}</h2>
+          <LoginPanel engine={engine} channel={channel} running={state.running} />
+        </section>
+      ))}
+
       <section className="panel">
         <header className="panel-header">
           <h2>今日费用</h2>
-          <span className="panel-meta">{state.brain.model}</span>
+          {state.brain.ready ? (
+            <label className="model-picker">
+              模型
+              <select value={state.brain.model} onChange={(event) => engine.send({ type: "brain.setModel", model: event.target.value as ModelId })}>
+                {modelOptions.map((option) => (
+                  <option key={option.id} value={option.id}>
+                    {option.label}（{option.note}）
+                  </option>
+                ))}
+                {/* A model set some other way still has to show up as what's in use. */}
+                {modelOptions.some((option) => option.id === state.brain.model) ? null : <option value={state.brain.model}>{state.brain.model}</option>}
+              </select>
+            </label>
+          ) : null}
         </header>
-        <div className="meter" role="img" aria-label={`今日已用 ${formatCost(todayUsd)}，上限 $${dailyLimitUsd}`}>
-          <span className={`meter-fill${usedPercent >= 100 ? " meter-full" : ""}`} style={{ width: `${usedPercent}%` }} />
-        </div>
-        <p className="meter-label">
-          {formatCost(todayUsd)} / ${dailyLimitUsd} · 群友搜索 {searchesToday} / {searchLimit} 次
+        <Spending label="群聊" usedUsd={todayUsd} limitUsd={dailyLimitUsd} />
+        <Spending label="我的工作" usedUsd={ownerTodayUsd} limitUsd={ownerDailyLimitUsd} />
+        <p className="panel-meta">
+          群友搜索 {searchesToday} / {searchLimit} 次
         </p>
       </section>
 
@@ -140,6 +179,7 @@ export function OverviewPage({ engine, state, onOpenActivity }: { engine: Engine
             />
           </header>
           {channel.status.detail ? <p className="panel-meta">{channel.status.detail}</p> : null}
+          {channel.canLogin && !needsAttention(channel) ? <LoginPanel engine={engine} channel={channel} running={state.running} /> : null}
           {channel.conversations.length ? (
             <ul className="rows">
               {channel.conversations.map((conversation) => (
@@ -147,7 +187,11 @@ export function OverviewPage({ engine, state, onOpenActivity }: { engine: Engine
               ))}
             </ul>
           ) : (
-            <p className="empty">还没有聊天。在群里发一条消息后，群会出现在这里，默认关闭，打开后才会回复。</p>
+            <p className="empty">
+              {channel.canLogin
+                ? "还没有聊天。登录后给机器人发一条消息，聊天会出现在这里。"
+                : "还没有聊天。在群里发一条消息后，群会出现在这里，默认关闭，打开后才会回复。"}
+            </p>
           )}
         </section>
       ))}

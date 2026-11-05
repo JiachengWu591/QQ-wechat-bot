@@ -1,11 +1,13 @@
 // The hub: everything a message goes through between arriving and a reply leaving.
 import { EventEmitter } from "node:events";
 import { randomInt, randomUUID } from "node:crypto";
+import { modelOptions } from "@shu/protocol";
 import type {
   AccessEntry,
   ActivityEntry,
   ActivityLevel,
   Autonomy,
+  ChannelLogin,
   ChannelStatus,
   ChatLine,
   ConversationView,
@@ -20,15 +22,23 @@ import type {
 import type { Brain, ToolOutcome } from "./brain.ts";
 import { atLeast, effectiveTier, RateLimiter, tierOf, type AccessList } from "./policy.ts";
 import { chatPrompt, systemPrompt } from "./prompt.ts";
-import type { Store } from "./store.ts";
-import type { LocalTool } from "./tools.ts";
-import type { Adapter, AdapterConversation } from "./types.ts";
+import type { BudgetLane, Store } from "./store.ts";
+import type { LocalTool, ToolContext } from "./tools.ts";
+import type { Adapter, AdapterConversation, AdapterMessage } from "./types.ts";
+import type { Workspace } from "./workspace.ts";
 
 export type EngineConfig = {
   botName: string;
   // Grants that come from configuration rather than pairing, such as the simulated owner.
   access: AccessList;
+  // Spent by group chat.
   dailyLimitUsd: number;
+  // Spent by the owner's work in private chats, which can be far larger per request.
+  ownerDailyLimitUsd: number;
+  // How long a task runs before the owner is told it's being worked on.
+  taskAckMs: number;
+  // How long a file sent on its own waits for the instruction that usually follows it.
+  fileSettleMs: number;
   webSearch: boolean;
   // Shared by everyone except the owner, who isn't limited.
   sharedSearchesPerDay: number;
@@ -51,8 +61,27 @@ type Pairing = PairingView & { failures: number };
 
 const PAIRING_TTL_MS = 10 * 60_000;
 const MAX_PAIRING_FAILURES = 5;
-const SEARCHES_PER_TURN = 3;
+const SEARCHES_PER_CHAT_CALL = 3;
+const SEARCHES_PER_TASK_CALL = 8;
 const DAY_MS = 24 * 60 * 60_000;
+const CANCEL_WORDS = new Set(["/cancel", "/stop", "取消", "停止"]);
+
+// What one model turn is working with, passed to everything that acts on its behalf.
+type Turn = {
+  trigger: ChatLine;
+  conversation: AdapterConversation;
+  adapter: Adapter;
+  title: string;
+  tier: Tier;
+  canSendFiles: boolean;
+  lane: BudgetLane;
+  limitUsd: number;
+  today: string;
+  controller: AbortController;
+  stoppedByBudget: boolean;
+  // Tells the owner a slow task is under way, unless there's already something to show for it.
+  ack: ReturnType<typeof setTimeout> | undefined;
+};
 
 export function dayKey(at: number): string {
   const date = new Date(at);
@@ -65,6 +94,7 @@ export class Engine extends EventEmitter<EngineEvents> {
   #brain: Brain | null;
   #adapters: Map<string, Adapter>;
   #tools: LocalTool[];
+  #workspace: Workspace;
   #config: EngineConfig;
   #now: () => number;
   #senderLimit: RateLimiter;
@@ -73,18 +103,32 @@ export class Engine extends EventEmitter<EngineEvents> {
   #running = false;
   #channelEnabled = new Map<string, boolean>();
   #channelStatus = new Map<string, ChannelStatus>();
+  #channelLogin = new Map<string, ChannelLogin>();
   // Anything older than this was sent while the channel was off and is never answered.
   #acceptSince = new Map<string, number>();
-  #inFlight = new Set<AbortController>();
+  // Each running turn and the conversation it belongs to.
+  #inFlight = new Map<AbortController, string>();
   #queues = new Map<string, Promise<void>>();
+  #intakes = new Map<string, Promise<string>>();
+  // Bumped by a cancel, so that turns still waiting in the queue don't start afterwards.
+  #turnEpochs = new Map<string, number>();
   #pairing: Pairing | null = null;
 
-  constructor(deps: { store: Store; brain: Brain | null; adapters: Adapter[]; tools: LocalTool[]; config: EngineConfig; now?: () => number }) {
+  constructor(deps: {
+    store: Store;
+    brain: Brain | null;
+    adapters: Adapter[];
+    tools: LocalTool[];
+    workspace: Workspace;
+    config: EngineConfig;
+    now?: () => number;
+  }) {
     super();
     this.#store = deps.store;
     this.#brain = deps.brain;
     this.#adapters = new Map(deps.adapters.map((adapter) => [adapter.id, adapter]));
     this.#tools = deps.tools;
+    this.#workspace = deps.workspace;
     this.#config = deps.config;
     this.#now = deps.now ?? Date.now;
     this.#senderLimit = new RateLimiter(deps.config.perSenderPerMinute, 60_000);
@@ -104,6 +148,8 @@ export class Engine extends EventEmitter<EngineEvents> {
         enabled: this.#channelEnabled.get(adapter.id) ?? false,
         status: this.#channelStatus.get(adapter.id) ?? { state: "stopped" },
         ...(adapter.botName?.() ? { botName: adapter.botName() as string } : {}),
+        canLogin: Boolean(adapter.beginLogin),
+        ...(this.#channelLogin.has(adapter.id) ? { login: this.#channelLogin.get(adapter.id) as ChannelLogin } : {}),
         conversations: this.#knownConversations(adapter.id).map((conversation): ConversationView => {
           const { title, ...settings } = this.#settings(adapter.id, conversation);
           return { id: conversation.id, kind: conversation.kind, title: title ?? conversation.title, ...settings };
@@ -113,10 +159,12 @@ export class Engine extends EventEmitter<EngineEvents> {
       usage: {
         todayUsd: this.#store.costForDay(today),
         dailyLimitUsd: this.#config.dailyLimitUsd,
+        ownerTodayUsd: this.#store.costForDay(today, "owner"),
+        ownerDailyLimitUsd: this.#config.ownerDailyLimitUsd,
         searchesToday: this.#sharedSearches(today),
         searchLimit: this.#config.sharedSearchesPerDay,
       },
-      brain: { ready: this.#brain !== null, model: this.#brain?.model ?? "未配置" },
+      brain: { ready: this.#brain !== null, model: this.#selectedModel() ?? "未配置" },
       simSenders: this.#config.simSenders,
       access: this.#pairedAccess(),
       pairing: this.#activePairing(),
@@ -146,7 +194,7 @@ export class Engine extends EventEmitter<EngineEvents> {
     if (!this.#running) return;
     this.#running = false;
     this.#pairing = null;
-    for (const controller of this.#inFlight) controller.abort();
+    for (const controller of this.#inFlight.keys()) controller.abort();
     this.#log("info", "已停止，进行中的任务已中止");
     this.#emitState();
     await Promise.allSettled([...this.#adapters.values()].map((adapter) => adapter.stop()));
@@ -164,6 +212,39 @@ export class Engine extends EventEmitter<EngineEvents> {
       await adapter.stop();
     }
     this.#log("info", `${adapter.name}已${enabled ? "打开" : "关闭"}`);
+    this.#emitState();
+  }
+
+  // A turn already running keeps the model it started with. The budgets don't change.
+  setModel(model: string) {
+    const option = modelOptions.find((candidate) => candidate.id === model);
+    if (!option) throw new Error(`没有这个模型：${model}`);
+    this.#store.setSetting("brain:model", option.id);
+    this.#log("info", `模型切换为 ${option.label}，下一条消息开始生效`);
+    this.#emitState();
+  }
+
+  // A saved choice that's no longer offered falls back to the default.
+  #selectedModel(): string | undefined {
+    const saved = this.#store.getSetting<string>("brain:model");
+    return modelOptions.some((option) => option.id === saved) ? saved : this.#brain?.model;
+  }
+
+  async beginChannelLogin(channelId: string) {
+    const adapter = this.#adapterFor(channelId);
+    if (!adapter.beginLogin) throw new Error(`${adapter.name}不用扫码登录。`);
+    if (!this.#running || !this.#channelEnabled.get(channelId)) throw new Error(`先打开总闸和${adapter.name}的开关。`);
+    await adapter.beginLogin();
+  }
+
+  submitChannelLoginCode(channelId: string, code: string) {
+    this.#adapterFor(channelId).submitLoginCode?.(code);
+  }
+
+  async logoutChannel(channelId: string) {
+    const adapter = this.#adapterFor(channelId);
+    await adapter.logout?.();
+    this.#log("info", `${adapter.name}已退出登录`);
     this.#emitState();
   }
 
@@ -212,7 +293,7 @@ export class Engine extends EventEmitter<EngineEvents> {
   }
 
   // Resolves once any reply this message triggers has been dealt with.
-  async handleInbound(message: InboundMessage): Promise<void> {
+  async handleInbound(message: AdapterMessage): Promise<void> {
     const adapter = this.#adapterFor(message.channelId);
     const summary = `${message.senderName}：${preview(message.text)}`;
     const incomingTitle = this.#titleForMessage(message);
@@ -236,6 +317,16 @@ export class Engine extends EventEmitter<EngineEvents> {
     if (!settings.enabled) return this.#log("blocked", `这个聊天已关闭，已丢弃 ${summary}`, title);
     if (message.at < (this.#acceptSince.get(adapter.id) ?? 0)) return this.#log("info", `跳过离线期间的消息 ${summary}`, title);
 
+    const key = `${message.channelId}:${message.conversationId}`;
+    // Taken before any file is fetched: a cancel covers everything sent ahead of it, including
+    // a message still being received.
+    const epoch = this.#turnEpochs.get(key) ?? 0;
+
+    // Handled here, not in the queue below, because the queue is what it has to interrupt.
+    if (tier === "owner" && conversation.kind === "dm" && CANCEL_WORDS.has(message.text.trim().toLowerCase())) {
+      return this.#cancelTurns(key, conversation, message);
+    }
+
     const line: ChatLine = {
       id: message.id,
       channelId: message.channelId,
@@ -243,7 +334,7 @@ export class Engine extends EventEmitter<EngineEvents> {
       direction: "in",
       senderId: message.senderId,
       senderName: message.senderName,
-      text: message.text,
+      text: await this.#receive(key, message, tier),
       at: message.at,
       tier,
     };
@@ -254,6 +345,14 @@ export class Engine extends EventEmitter<EngineEvents> {
 
     if (settings.autonomy === "notify") return this.#log("info", `有消息需要你看：${summary}`, title);
 
+    // A file and what to do with it usually arrive as two messages, a moment apart. If the
+    // instruction turns up, its turn sees both, and the bot doesn't ask what it was just told.
+    if (message.attachments?.length && !message.text.trim()) {
+      await new Promise((resolve) => setTimeout(resolve, this.#config.fileSettleMs));
+      const latest = this.#store.recentMessages(message.channelId, message.conversationId, 10).findLast((entry) => entry.direction === "in");
+      if (latest?.id !== line.id) return;
+    }
+
     const now = this.#now();
     if (!this.#senderLimit.allow(`${message.channelId}:${message.senderId}`, now)) {
       return this.#log("blocked", `${message.senderName} 发得太频繁，这条不回复`, title);
@@ -263,10 +362,50 @@ export class Engine extends EventEmitter<EngineEvents> {
     }
 
     // One turn at a time per conversation, so replies can't overtake each other.
-    const key = `${message.channelId}:${message.conversationId}`;
-    const turn = (this.#queues.get(key) ?? Promise.resolve()).then(() => this.#runTurn(line, conversation, adapter, settings.autonomy));
+    const turn =(this.#queues.get(key) ?? Promise.resolve()).then(() => {
+      if ((this.#turnEpochs.get(key) ?? 0) !== epoch) return this.#log("blocked", "已取消，这条没有处理", title);
+      return this.#runTurn(line, conversation, adapter, settings.autonomy);
+    });
     this.#queues.set(key, turn);
     await turn;
+  }
+
+  // Stops what's running in this conversation and anything queued behind it.
+  async #cancelTurns(key: string, conversation: AdapterConversation, message: AdapterMessage) {
+    this.#turnEpochs.set(key, (this.#turnEpochs.get(key) ?? 0) + 1);
+    let stopped = 0;
+    for (const [controller, owner] of this.#inFlight) {
+      if (owner !== key) continue;
+      controller.abort();
+      stopped += 1;
+    }
+    this.#log("info", stopped ? "主人取消了进行中的任务" : "主人发了取消，但没有进行中的任务", this.#titleOf(message.channelId, conversation));
+    await this.#notify(conversation, message.channelId, stopped ? "已取消。" : "现在没有进行中的任务。", "owner", message.id);
+  }
+
+  // Files are fetched in the order they arrived, so "summarize this" sent right after a file
+  // waits for it. Only the owner's private files are ever fetched: nobody else can make this
+  // computer download something.
+  #receive(key: string, message: AdapterMessage, tier: Tier): Promise<string> {
+    const received = (this.#intakes.get(key) ?? Promise.resolve("")).then(async () => {
+      const attachments = message.attachments ?? [];
+      if (!attachments.length) return message.text;
+      if (tier !== "owner" || message.conversationKind !== "dm") return [message.text, "[对方发了文件，没有保存]"].filter(Boolean).join("\n");
+
+      const notes: string[] = [];
+      for (const attachment of attachments) {
+        try {
+          notes.push(`[收到文件，已保存为 ${await this.#workspace.saveInbox(attachment.name, await attachment.download())}]`);
+        } catch (error) {
+          this.#log("error", `文件 ${attachment.name} 下载失败：${error instanceof Error ? error.message : String(error)}`);
+          notes.push(`[收到文件 ${attachment.name}，但是下载失败了，告诉主人重发]`);
+        }
+      }
+      if (!message.text.trim()) notes.push("（主人没说要做什么的话，问一句就好，不用先读文件。）");
+      return [message.text, ...notes].filter(Boolean).join("\n");
+    });
+    this.#intakes.set(key, received);
+    return received;
   }
 
   async approve(pendingId: string, editedText?: string) {
@@ -292,91 +431,175 @@ export class Engine extends EventEmitter<EngineEvents> {
     if (!this.#running) return;
     if (!this.#brain) return this.#log("error", "还没有配置 API key，无法回复", title);
 
-    const today = dayKey(this.#now());
-    if (this.#store.costForDay(today) >= this.#config.dailyLimitUsd) {
-      return this.#log("blocked", `今日预算 $${this.#config.dailyLimitUsd} 已用完，不再调用模型`, title);
-    }
-
     const recent = this.#store.recentMessages(trigger.channelId, trigger.conversationId, this.#config.contextMessages + 1);
     const history = recent.filter((line) => line.id !== trigger.id);
     const tier = effectiveTier([...history, trigger].map((line) => line.tier), conversation.kind);
-    const offered = this.#tools.filter((tool) => atLeast(tier, tool.minTier));
     const isOwner = trigger.tier === "owner";
     const botName = adapter.botName?.() ?? this.#config.botName;
 
+    // The owner's private chat is where work happens. A group never counts, even for the owner.
+    const isWork = tier === "owner" && conversation.kind === "dm";
+    const lane: BudgetLane = isWork ? "owner" : "shared";
+    const limitUsd = isWork ? this.#config.ownerDailyLimitUsd : this.#config.dailyLimitUsd;
+    const today = dayKey(this.#now());
+    if (this.#store.costForDay(today, lane) >= limitUsd) {
+      this.#log("blocked", `今日预算 $${limitUsd} 已用完，不再调用模型`, title);
+      // In a group silence is fine, but the owner is waiting for a result.
+      if (isWork) await this.#notify(conversation, trigger.channelId, `今日工作预算 $${limitUsd} 已用完，这件事没有做。`, tier, trigger.id);
+      return;
+    }
+
     const controller = new AbortController();
-    this.#inFlight.add(controller);
+    const turn: Turn = {
+      trigger,
+      conversation,
+      adapter,
+      title,
+      tier,
+      // A held reply needs the owner's approval, and a sent file can't be taken back.
+      canSendFiles: Boolean(adapter.sendFile) && autonomy === "auto",
+      lane,
+      limitUsd,
+      today,
+      controller,
+      stoppedByBudget: false,
+      ack:
+        isWork && autonomy === "auto"
+          ? setTimeout(() => void this.#notify(conversation, trigger.channelId, "正在处理，完成后发给你。发“取消”可以停止。", tier, trigger.id), this.#config.taskAckMs)
+          : undefined,
+    };
+    const offered = this.#tools.filter((tool) => atLeast(tier, tool.minTier) && (!tool.needsSendFile || turn.canSendFiles));
+
+    this.#inFlight.set(controller, `${trigger.channelId}:${trigger.conversationId}`);
     try {
       const result = await this.#brain.reply({
-        system: systemPrompt(botName, adapter.promptHint),
+        model: this.#selectedModel() ?? this.#brain.model,
+        system: systemPrompt(botName, adapter.promptHint, isWork),
         prompt: chatPrompt({ conversationTitle: title, kind: conversation.kind, history, current: trigger }),
         tools: offered.map(({ name, description, inputSchema }) => ({ name, description, inputSchema })),
-        webSearchUses: this.#searchAllowance(isOwner, today),
+        profile: isWork ? "task" : "chat",
+        webSearchUses: this.#searchAllowance(isOwner, isWork, today),
         signal: controller.signal,
-        runTool: (name, input) => this.#runTool(name, input, tier, title, controller.signal),
+        onCost: (costUsd) => {
+          this.#store.addCost(today, costUsd, lane);
+          this.#emitState();
+        },
+        runTool: (name, input) => this.#runTool(name, input, turn),
       });
-      this.#store.addCost(today, result.costUsd);
       if (!isOwner && result.webSearches > 0) this.#store.setSetting(`searches:${today}`, this.#sharedSearches(today) + result.webSearches);
 
-      if (controller.signal.aborted) return this.#log("blocked", "已停止，这条回复没有发送", title);
-      const text = result.text.trim();
+      if (controller.signal.aborted) return await this.#turnStopped(turn);
       if (result.refused) this.#log("blocked", "模型拒绝回复这条消息", title);
+      if (result.truncated) this.#log("error", "回复太长，到了输出上限被截断", title);
+      const text = [result.text.trim(), result.truncated ? "（内容太长，到了上限被截断了，可以让我分几部分做。）" : ""].filter(Boolean).join("\n\n");
       if (!text) return this.#emitState();
 
-      if (autonomy === "auto") {
-        await this.#deliver(conversation, trigger.channelId, text, tier, trigger.id, result.costUsd);
-      } else {
-        const pending: PendingReply = {
-          id: randomUUID(),
-          channelId: trigger.channelId,
-          conversationId: trigger.conversationId,
-          conversationTitle: title,
-          replyToId: trigger.id,
-          triggerSender: trigger.senderName,
-          triggerText: trigger.text,
-          draft: text,
-          tier,
-          costUsd: result.costUsd,
-          createdAt: this.#now(),
-        };
-        this.#store.addPending(pending);
+      if (autonomy !== "auto") {
+        this.#hold(turn, text, result.costUsd);
         this.#log("info", `写好了给 ${trigger.senderName} 的回复，等你确认`, title, result.costUsd);
+      } else {
+        try {
+          await this.#deliver(conversation, trigger.channelId, text, tier, trigger.id, result.costUsd);
+        } catch (error) {
+          if (!isWork) throw error;
+          // The work is done and paid for, so a failed send mustn't throw it away.
+          this.#hold(turn, text, result.costUsd);
+          this.#log("error", `结果发送失败，已放到待确认：${error instanceof Error ? error.message : String(error)}`, title, result.costUsd);
+          await this.#notify(conversation, trigger.channelId, "结果写好了，但是发送失败。可以到控制台的“待确认”里重发。", tier, trigger.id);
+        }
       }
       this.#emitState();
     } catch (error) {
-      if (controller.signal.aborted) return this.#log("blocked", "已停止，这条回复没有发送", title);
+      if (controller.signal.aborted) return await this.#turnStopped(turn);
       this.#log("error", `回复失败：${error instanceof Error ? error.message : String(error)}`, title);
+      // Otherwise the owner would be left waiting on a task that has already died.
+      if (isWork) await this.#notify(conversation, trigger.channelId, "这件事没有做完，出错了。详情在控制台的活动页。", tier, trigger.id);
     } finally {
+      clearTimeout(turn.ack);
       this.#inFlight.delete(controller);
+    }
+  }
+
+  #hold(turn: Turn, draft: string, costUsd: number) {
+    const { trigger, tier, title } = turn;
+    const pending: PendingReply = {
+      id: randomUUID(),
+      channelId: trigger.channelId,
+      conversationId: trigger.conversationId,
+      conversationTitle: title,
+      replyToId: trigger.id,
+      triggerSender: trigger.senderName,
+      triggerText: trigger.text,
+      draft,
+      tier,
+      costUsd,
+      createdAt: this.#now(),
+    };
+    this.#store.addPending(pending);
+  }
+
+  async #turnStopped(turn: Turn) {
+    if (!turn.stoppedByBudget) return this.#log("blocked", "已停止，这条回复没有发送", turn.title);
+    this.#log("blocked", `今日预算 $${turn.limitUsd} 用完了，任务已中止`, turn.title);
+    if (turn.lane === "owner") {
+      await this.#notify(turn.conversation, turn.trigger.channelId, `今日工作预算 $${turn.limitUsd} 用完了，任务停在中途。已经生成的文件还在工作区。`, turn.tier, turn.trigger.id);
     }
   }
 
   // The model only sees the tools offered above, but a call is checked again here so
   // that a mistake there, or a model naming a tool it wasn't given, still gets nowhere.
-  async #runTool(name: string, input: unknown, tier: Tier, title: string, signal: AbortSignal): Promise<ToolOutcome> {
+  async #runTool(name: string, input: unknown, turn: Turn): Promise<ToolOutcome> {
+    const { tier, title, controller } = turn;
     const tool = this.#tools.find((candidate) => candidate.name === name);
-    if (!tool || !atLeast(tier, tool.minTier)) {
+    if (!tool || !atLeast(tier, tool.minTier) || (tool.needsSendFile && !turn.canSendFiles)) {
       this.#log("blocked", `已拦截工具调用 ${name}（当前权限 ${tier}）`, title);
       return { content: "没有权限使用这个工具。", isError: true };
     }
-    if (signal.aborted || !this.#running) {
+    if (controller.signal.aborted || !this.#running) {
       return { content: "已停止。", isError: true };
     }
+    // Checked when the model wants to carry on, so a reply it has already finished, and paid
+    // for, still gets delivered. A single model call is bounded by its output limit.
+    if (this.#store.costForDay(turn.today, turn.lane) >= turn.limitUsd) {
+      turn.stoppedByBudget = true;
+      controller.abort();
+      return { content: "今日预算已用完。", isError: true };
+    }
+    const context: ToolContext = turn.canSendFiles ? { sendFile: (path, fileName) => this.#deliverFile(turn, path, fileName) } : {};
     try {
-      const content = await tool.run(input);
+      const content = await tool.run(input, context);
       this.#log("ok", `调用了工具 ${name}`, title);
       return { content, isError: false };
     } catch (error) {
-      this.#log("error", `工具 ${name} 出错`, title);
+      this.#log("error", `工具 ${name} 出错：${error instanceof Error ? error.message : String(error)}`, title);
       return { content: error instanceof Error ? error.message : String(error), isError: true };
     }
   }
 
-  #searchAllowance(isOwner: boolean, today: string): number {
+  // Tools only name a file. Where it goes is fixed here: the conversation this turn belongs to.
+  async #deliverFile(turn: Turn, path: string, fileName: string) {
+    const { conversation, adapter, trigger, tier, title } = turn;
+    if (turn.controller.signal.aborted || !this.#canSend(trigger.channelId, conversation.id)) throw new Error("已关闭，文件没有发送。");
+    clearTimeout(turn.ack);
+    await adapter.sendFile?.(conversation.id, path, fileName);
+    this.#recordOutgoing(trigger.channelId, conversation.id, adapter, `[文件] ${fileName}`, tier);
+    this.#log("ok", `已发送文件：${fileName}`, title);
+  }
+
+  // For things the bot says about the work itself, which must never take a turn down with them.
+  async #notify(conversation: AdapterConversation, channelId: string, text: string, tier: Tier, replyToId: string) {
+    await this.#deliver(conversation, channelId, text, tier, replyToId).catch((error: unknown) => {
+      this.#log("error", `消息发送失败：${error instanceof Error ? error.message : String(error)}`, this.#titleOf(channelId, conversation));
+    });
+  }
+
+  // A task's searches are bounded by the owner's budget, so researching a report can use more.
+  #searchAllowance(isOwner: boolean, isWork: boolean, today: string): number {
     if (!this.#config.webSearch) return 0;
-    if (isOwner) return SEARCHES_PER_TURN;
+    if (isWork) return SEARCHES_PER_TASK_CALL;
+    if (isOwner) return SEARCHES_PER_CHAT_CALL;
     const left = this.#config.sharedSearchesPerDay - this.#sharedSearches(today);
-    return Math.max(0, Math.min(SEARCHES_PER_TURN, left));
+    return Math.max(0, Math.min(SEARCHES_PER_CHAT_CALL, left));
   }
 
   #sharedSearches(today: string): number {
@@ -396,10 +619,15 @@ export class Engine extends EventEmitter<EngineEvents> {
     }
     const adapter = this.#adapterFor(channelId);
     await adapter.send({ channelId, conversationId: conversation.id, conversationKind: conversation.kind, text, replyToId });
+    this.#recordOutgoing(channelId, conversation.id, adapter, text, tier);
+    this.#log("ok", `已回复：${preview(text)}`, title, costUsd);
+  }
+
+  #recordOutgoing(channelId: string, conversationId: string, adapter: Adapter, text: string, tier: Tier) {
     const line: ChatLine = {
       id: randomUUID(),
       channelId,
-      conversationId: conversation.id,
+      conversationId,
       direction: "out",
       senderId: "bot",
       senderName: adapter.botName?.() ?? this.#config.botName,
@@ -409,7 +637,6 @@ export class Engine extends EventEmitter<EngineEvents> {
     };
     this.#store.addMessage(line);
     this.emit("chat", line);
-    this.#log("ok", `已回复：${preview(text)}`, title, costUsd);
   }
 
   async #tryPairing(message: InboundMessage, adapter: Adapter): Promise<boolean> {
@@ -472,8 +699,13 @@ export class Engine extends EventEmitter<EngineEvents> {
   #accessList(): AccessList {
     const paired = this.#pairedAccess();
     const identity = ({ channelId, senderId }: AccessEntry) => ({ channelId, senderId });
+    // Whoever scanned the login code on this machine, as confirmed by the platform.
+    const signedIn = [...this.#adapters.values()].flatMap((adapter) => {
+      const senderId = adapter.ownerId?.();
+      return senderId ? [{ channelId: adapter.id, senderId }] : [];
+    });
     return {
-      owners: [...this.#config.access.owners, ...paired.filter((entry) => entry.tier === "owner").map(identity)],
+      owners: [...this.#config.access.owners, ...signedIn, ...paired.filter((entry) => entry.tier === "owner").map(identity)],
       trusted: [...this.#config.access.trusted, ...paired.filter((entry) => entry.tier === "trusted").map(identity)],
     };
   }
@@ -501,7 +733,14 @@ export class Engine extends EventEmitter<EngineEvents> {
           // stops the retries is an error.
           if (status.state === "connecting" && previous?.state === "connected") this.#log("info", `${adapter.name}断开了：${status.detail ?? "原因未知"}`);
           if (status.state === "error") this.#log("error", `${adapter.name}连接失败：${status.detail ?? "未知原因"}`);
+          if (status.state === "needs-login") this.#log("info", `${adapter.name}：${status.detail ?? "需要登录"}`);
         }
+        this.#emitState();
+      },
+      onLogin: (login) => {
+        if (login) this.#channelLogin.set(adapter.id, login);
+        else this.#channelLogin.delete(adapter.id);
+        if (login?.state === "failed") this.#log("error", `${adapter.name}登录失败：${login.message}`);
         this.#emitState();
       },
     });

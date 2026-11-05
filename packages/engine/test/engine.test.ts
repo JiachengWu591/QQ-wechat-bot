@@ -442,7 +442,7 @@ describe("web search allowance", () => {
     const h = harness({ config: { webSearch: true, sharedSearchesPerDay: 0 } });
     h.fake.behavior = async () => ({ text: "好", webSearches: 3 });
     await h.engine.start();
-    await h.engine.handleInbound(h.message(OWNER, DM, "查一下"));
+    await h.engine.handleInbound(h.message(OWNER, GROUP, "查一下"));
     assert.equal(h.fake.requests[0]!.webSearchUses, 3);
     assert.equal(h.engine.getState().usage.searchesToday, 0);
   });

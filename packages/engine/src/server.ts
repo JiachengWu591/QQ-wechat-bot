@@ -57,8 +57,16 @@ export function startServer(options: ServerOptions): Promise<{ port: number; clo
         return engine.start();
       case "engine.stop":
         return engine.stop();
+      case "brain.setModel":
+        return engine.setModel(command.model);
       case "channel.setEnabled":
         return engine.setChannelEnabled(command.channelId, command.enabled);
+      case "channel.login":
+        return engine.beginChannelLogin(command.channelId);
+      case "channel.loginCode":
+        return engine.submitChannelLoginCode(command.channelId, command.code);
+      case "channel.logout":
+        return engine.logoutChannel(command.channelId);
       case "conversation.setEnabled":
         return engine.setConversationEnabled(command.channelId, command.conversationId, command.enabled);
       case "conversation.setAutonomy":

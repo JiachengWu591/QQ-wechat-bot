@@ -11,11 +11,13 @@
     "@shu/protocol": "workspace:*",
     "@tauri-apps/api": "^2.12.4",
     "lucide-react": "^0.511.0",
+    "qrcode": "^1.5.4",
     "react": "^19.1.0",
     "react-dom": "^19.1.0"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.12.4",
+    "@types/qrcode": "^1.5.6",
     "@types/react": "^19.1.0",
     "@types/react-dom": "^19.1.0",
     "@vitejs/plugin-react": "^4.5.0",

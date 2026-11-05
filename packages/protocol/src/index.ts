@@ -14,6 +14,16 @@ export type GrantedTier = (typeof grantedTiers)[number];
 export const autonomyLevels = ["notify", "confirm", "auto"] as const;
 export type Autonomy = (typeof autonomyLevels)[number];
 
+// The models the owner can switch between in the console.
+export const modelIds = ["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5"] as const;
+export type ModelId = (typeof modelIds)[number];
+
+export const modelOptions: { id: ModelId; label: string; note: string }[] = [
+  { id: "claude-opus-5-5", label: "Opus 5.5", note: "最强，最贵" },
+  { id: "claude-sonnet-5-5", label: "Sonnet 5.5", note: "约为 Opus 的一半价" },
+  { id: "claude-haiku-5-5", label: "Haiku 5.5", note: "约为 Opus 的 1/40 价" },
+];
+
 export type ConversationKind = "group" | "dm";
 
 export type InboundMessage = {
@@ -64,9 +74,16 @@ export type ConversationView = {
 };
 
 export type ChannelStatus = {
-  state: "stopped" | "connecting" | "connected" | "error";
+  state: "stopped" | "connecting" | "connected" | "error" | "needs-login";
   detail?: string;
 };
+
+// A QR login in progress, for platforms that sign in that way.
+export type ChannelLogin =
+  | { state: "qr"; qrContent: string }
+  | { state: "scanned" }
+  | { state: "verify" }
+  | { state: "failed"; message: string };
 
 export type ChannelView = {
   id: string;
@@ -74,6 +91,8 @@ export type ChannelView = {
   enabled: boolean;
   status: ChannelStatus;
   botName?: string;
+  canLogin: boolean;
+  login?: ChannelLogin;
   conversations: ConversationView[];
 };
 
@@ -111,7 +130,14 @@ export type EngineState = {
   running: boolean;
   channels: ChannelView[];
   pending: PendingReply[];
-  usage: { todayUsd: number; dailyLimitUsd: number; searchesToday: number; searchLimit: number };
+  usage: {
+    todayUsd: number;
+    dailyLimitUsd: number;
+    ownerTodayUsd: number;
+    ownerDailyLimitUsd: number;
+    searchesToday: number;
+    searchLimit: number;
+  };
   brain: { ready: boolean; model: string };
   simSenders: SimSender[];
   access: AccessEntry[];
@@ -130,7 +156,11 @@ const id = z.string().min(1).max(200);
 export const commandSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("engine.start") }),
   z.object({ type: z.literal("engine.stop") }),
+  z.object({ type: z.literal("brain.setModel"), model: z.enum(modelIds) }),
   z.object({ type: z.literal("channel.setEnabled"), channelId: id, enabled: z.boolean() }),
+  z.object({ type: z.literal("channel.login"), channelId: id }),
+  z.object({ type: z.literal("channel.loginCode"), channelId: id, code: z.string().trim().min(1).max(20) }),
+  z.object({ type: z.literal("channel.logout"), channelId: id }),
   z.object({ type: z.literal("conversation.setEnabled"), channelId: id, conversationId: id, enabled: z.boolean() }),
   z.object({ type: z.literal("conversation.setAutonomy"), channelId: id, conversationId: id, autonomy: z.enum(autonomyLevels) }),
   z.object({ type: z.literal("conversation.rename"), channelId: id, conversationId: id, title: z.string().trim().min(1).max(60) }),

@@ -182,6 +182,8 @@ input {
 }
 
 .content {
+  /* Contains absolutely positioned children, which would otherwise scroll the whole page. */
+  position: relative;
   display: flex;
   flex-direction: column;
   gap: 12px;
@@ -385,6 +387,36 @@ input {
   background: var(--danger);
 }
 
+.panel-attention {
+  border-color: var(--warn-text);
+}
+
+.channel-status-needs-login {
+  color: var(--warn-text);
+}
+
+.channel-status-needs-login .dot {
+  background: var(--warn-text);
+}
+
+.login {
+  flex-direction: row;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 14px;
+}
+
+.login > div {
+  flex: 1;
+  min-width: 180px;
+}
+
+.qr-code {
+  flex: none;
+  max-width: 100%;
+  border-radius: 6px;
+}
+
 .pairing {
   display: flex;
   flex-direction: column;
@@ -444,9 +476,33 @@ textarea {
 }
 
 .meter-label {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
   color: var(--text-muted);
   font-size: 13px;
   font-variant-numeric: tabular-nums;
+}
+
+.model-picker {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  color: var(--text-muted);
+  font-size: 13px;
+}
+
+.model-picker select {
+  min-width: 0;
+  max-width: 100%;
+  color: var(--text);
+}
+
+.spending {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
 }
 
 /* Activity */

@@ -1,6 +1,6 @@
 // Starts the engine and the console together for development, with a fresh token per run.
-// The API key is read from spikes/.env.local if it exists; without it the bot can't reply,
-// but everything else works.
+// The API key is read from spikes/.env.local if it exists, or from SHU_ENV_FILE; without it
+// the bot can't reply, but everything else works.
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { existsSync, mkdirSync } from "node:fs";
@@ -14,7 +14,7 @@ const webPort = process.env.SHU_WEB_PORT ?? "5173";
 const dataDir = join(root, ".dev", "data");
 mkdirSync(dataDir, { recursive: true });
 
-const envFile = join(root, "spikes", ".env.local");
+const envFile = process.env.SHU_ENV_FILE ?? join(root, "spikes", ".env.local");
 const nodeArgs = ["--disable-warning=ExperimentalWarning", ...(existsSync(envFile) ? [`--env-file=${envFile}`] : []), "src/main.ts"];
 
 const engine = spawn(process.execPath, nodeArgs, {

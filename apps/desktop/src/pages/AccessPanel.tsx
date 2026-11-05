@@ -4,8 +4,9 @@ import type { EngineState, GrantedTier } from "@shu/protocol";
 import { tierLabels } from "../ui.tsx";
 import type { EngineApi } from "../useEngine.ts";
 
-// The simulated channel has built-in identities, so only real platforms can be paired.
-const realChannels = (state: EngineState) => state.channels.filter((channel) => channel.id !== "sim");
+// The simulated channel has built-in identities, and signing in already says who the owner
+// is, so pairing is only for platforms that do neither.
+const realChannels = (state: EngineState) => state.channels.filter((channel) => channel.id !== "sim" && !channel.canLogin);
 
 export function AccessPanel({ engine, state }: { engine: EngineApi; state: EngineState }) {
   const channels = realChannels(state);

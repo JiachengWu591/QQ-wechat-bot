@@ -59,6 +59,15 @@ type ActivityRow = {
   cost_usd: number | null;
 };
 
+// Group chat and the owner's own work spend from separate daily budgets, so a long report
+// can't use up what the group runs on, or the other way round.
+export type BudgetLane = "shared" | "owner";
+
+// Rows from before the lanes existed are plain days, which is the shared lane.
+function usageKey(day: string, lane: BudgetLane): string {
+  return lane === "shared" ? day : `${day}:${lane}`;
+}
+
 function toLine(row: MessageRow): ChatLine {
   return {
     id: row.id,
@@ -140,14 +149,14 @@ export class Store {
     this.#db.prepare(`DELETE FROM activity WHERE at < ?`).run(at);
   }
 
-  addCost(day: string, costUsd: number) {
+  addCost(day: string, costUsd: number, lane: BudgetLane = "shared") {
     this.#db
       .prepare(`INSERT INTO usage (day, cost_usd) VALUES (?, ?) ON CONFLICT (day) DO UPDATE SET cost_usd = cost_usd + excluded.cost_usd`)
-      .run(day, costUsd);
+      .run(usageKey(day, lane), costUsd);
   }
 
-  costForDay(day: string): number {
-    const row = this.#db.prepare(`SELECT cost_usd FROM usage WHERE day = ?`).get(day) as { cost_usd: number } | undefined;
+  costForDay(day: string, lane: BudgetLane = "shared"): number {
+    const row = this.#db.prepare(`SELECT cost_usd FROM usage WHERE day = ?`).get(usageKey(day, lane)) as { cost_usd: number } | undefined;
     return row?.cost_usd ?? 0;
   }
 
