@@ -29,6 +29,12 @@ public static class Win {
   [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
   [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
   [DllImport("user32.dll")] public static extern void keybd_event(byte vk, byte scan, uint flags, UIntPtr extra);
+  [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr h, uint msg, IntPtr w, IntPtr l);
+  [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X, Y; public POINT(int x, int y) { X = x; Y = y; } }
+  [DllImport("user32.dll")] static extern IntPtr WindowFromPoint(POINT p);
+  [DllImport("user32.dll")] static extern IntPtr GetAncestor(IntPtr h, uint flags);
+  [DllImport("user32.dll")] public static extern bool GetCursorPos(out POINT p);
+  public static IntPtr RootAt(int x, int y) { return GetAncestor(WindowFromPoint(new POINT(x, y)), 2); }
   [DllImport("user32.dll")] static extern bool GetLastInputInfo(ref LASTINPUTINFO info);
   [StructLayout(LayoutKind.Explicit, Size = 40)] struct INPUT {
     [FieldOffset(0)] public uint type; [FieldOffset(8)] public ushort vk; [FieldOffset(10)] public ushort scan;
@@ -141,7 +147,7 @@ function Find-WeChatWindow {
         $className = New-Object System.Text.StringBuilder 256
         [Win]::GetClassName($handle, $className, 256) | Out-Null
         $found = [pscustomobject]@{
-            Handle = $handle; ClassName = "$className"; Width = $width; Height = $height
+            Handle = $handle; ClassName = "$className"; Left = $rect.Left; Top = $rect.Top; Width = $width; Height = $height
             Minimized = [Win]::IsIconic($handle)
             ColumnWidth = [int](296 * $script:dpiScale); HeaderHeight = [int](80 * $script:dpiScale)
         }
@@ -185,7 +191,7 @@ function Save-ChatArea([string]$path, $window, [string]$outPath) {
     } finally { $source.Dispose() }
 }
 
-function Read-RegionLines([string]$path, [int]$left, [int]$top, [int]$width, [int]$height) {
+function Read-RegionLines([string]$path, [int]$left, [int]$top, [int]$width, [int]$height, [int[]]$ExtraContrastScales = @()) {
     $cropPath = "$path.region.png"
     $source = [System.Drawing.Image]::FromFile($path)
     try {
@@ -196,14 +202,15 @@ function Read-RegionLines([string]$path, [int]$left, [int]$top, [int]$width, [in
         $graphics.Dispose(); $crop.Save($cropPath, [System.Drawing.Imaging.ImageFormat]::Png); $crop.Dispose()
     } finally { $source.Dispose() }
     try {
-        Read-OcrAll $cropPath | ForEach-Object { $_.X += $left; $_.Y += $top; $_ }
+        @(Read-OcrAll $cropPath) + @($ExtraContrastScales | ForEach-Object { Read-OcrLines $cropPath -Scale $_ }) | ForEach-Object { $_.X += $left; $_.Y += $top; $_ }
     } finally { Remove-Item $cropPath -ErrorAction SilentlyContinue }
 }
 
 # Whole-window OCR skipped the header on real WeChat while a crop of it still gave
-# results, so the title gets its own read.
+# results, so the title gets its own read. No single setting is reliable: on 2026-11-05 the real
+# title was one character off at 3x and above, and exact with contrast at 1x and 2x.
 function Read-HeaderLines([string]$path, $window) {
-    Read-RegionLines $path $window.ColumnWidth 0 ($window.Width - $window.ColumnWidth) $window.HeaderHeight
+    Read-RegionLines $path $window.ColumnWidth 0 ($window.Width - $window.ColumnWidth) $window.HeaderHeight -ExtraContrastScales 1, 2
 }
 
 # Whole-window OCR also missed text typed into the input box, so the two places typed
