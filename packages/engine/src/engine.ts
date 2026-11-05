@@ -334,7 +334,7 @@ export class Engine extends EventEmitter<EngineEvents> {
         return await this.#remindOwner(mentionReminder(group, "内容没读出来，请自己看一下。"));
       }
       const drafted = this.#holdWorkDraft(group, read, result.costUsd);
-      this.#log("ok", `读了 ${images.length} 屏${reachedTop ? "（已到顶）" : ""}，${read.messages.length} 条消息${drafted ? "，写了草稿" : ""}`, group, result.costUsd);
+      this.#log("ok", `读了 ${images.length} 屏${reachedTop ? "（已到顶）" : ""}，${read.messages.length} 条消息，${drafted ? "写了草稿" : "没有写草稿"}`, group, result.costUsd);
       await this.#remindOwner(readReminder(group, read));
     } catch (error) {
       if (signal.aborted) return;

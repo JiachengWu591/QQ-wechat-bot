@@ -126,6 +126,7 @@ describe("the prompt", () => {
     assert.match(prompt, /【】/);
     assert.match(prompt, /不要写猜的内容/);
     assert.match(prompt, /不要写 @/);
+    assert.match(prompt, /只要有人 @ 了主人，就要写 draft/);
   });
 
   it("names the group, and explains overlap only when there's more than one page", () => {
@@ -138,13 +139,17 @@ describe("the prompt", () => {
 
 describe("what the owner is told", () => {
   it("gives the group, who said what, and the gist", () => {
-    assert.equal(readReminder("项目周会群", answer), "“项目周会群”里有人 @ 你。\n小明：@主人 报告发一下\n小明在催报告。");
+    assert.equal(readReminder("项目周会群", { ...answer, draft: "周五发。" }), "“项目周会群”里有人 @ 你。\n小明：@主人 报告发一下\n小明在催报告。\n草稿：周五发。\n要发送的话，到控制台的“待确认”里确认。");
   });
 
   it("copes with not knowing who, or with no mention at all", () => {
-    assert.equal(readReminder("甲", { ...answer, mention: { sender: null, text: "在吗" } }), "“甲”里有人 @ 你。\n有人：在吗\n小明在催报告。");
-    assert.equal(readReminder("甲", { ...answer, mention: null }), "“甲”里有人 @ 你。\n小明在催报告。");
-    assert.equal(readReminder("甲", { ...answer, mention: null, summary: "" }), "“甲”里有人 @ 你。");
+    assert.equal(readReminder("甲", { ...answer, draft: "好", mention: { sender: null, text: "在吗" }, summary: "" }), "“甲”里有人 @ 你。\n有人：在吗\n草稿：好\n要发送的话，到控制台的“待确认”里确认。");
+    assert.equal(readReminder("甲", { ...answer, draft: "好", mention: null, summary: "" }), "“甲”里有人 @ 你。\n草稿：好\n要发送的话，到控制台的“待确认”里确认。");
+  });
+
+  it("says so when there's no draft, so the owner doesn't go looking for one", () => {
+    assert.equal(readReminder("甲", { ...answer, mention: null, summary: "" }), "“甲”里有人 @ 你。\n这次没有写草稿，要回复的话请自己回。");
+    assert.equal(readReminder("甲", { ...answer, draft: "  " }), "“甲”里有人 @ 你。\n小明：@主人 报告发一下\n小明在催报告。\n这次没有写草稿，要回复的话请自己回。");
   });
 
   it("keeps it short, whatever is on screen", () => {
@@ -156,7 +161,7 @@ describe("what the owner is told", () => {
 
   it("flattens line breaks, so a message can't pose as something else in the reminder", () => {
     const reminder = readReminder("甲", { messages: [], mention: { sender: "小明", text: "第一行\n\n第二行" }, summary: "" });
-    assert.equal(reminder, "“甲”里有人 @ 你。\n小明：第一行 第二行");
+    assert.equal(reminder, "“甲”里有人 @ 你。\n小明：第一行 第二行\n这次没有写草稿，要回复的话请自己回。");
   });
 
   it("includes the draft, and says where to deal with it", () => {
@@ -166,9 +171,9 @@ describe("what the owner is told", () => {
     );
   });
 
-  it("leaves the draft out when there isn't one", () => {
-    assert.doesNotMatch(readReminder("甲", { ...answer, draft: null }), /草稿/);
-    assert.doesNotMatch(readReminder("甲", { ...answer, draft: "  " }), /草稿/);
+  it("doesn't point to a draft when there isn't one", () => {
+    assert.doesNotMatch(readReminder("甲", { ...answer, draft: null }), /草稿：|待确认/);
+    assert.doesNotMatch(readReminder("甲", { ...answer, draft: "  " }), /草稿：|待确认/);
   });
 
   it("adds a note when there is one", () => {

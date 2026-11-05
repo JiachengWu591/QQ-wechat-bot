@@ -255,9 +255,9 @@ describe("reading WeChat from the engine", () => {
       await until(() => owned.sent.length === 1, "reminder");
       assert.deepEqual(screen.opened, [100]);
       assert.equal(owned.sent[0]!.conversationId, "owner-account");
-      assert.equal(owned.sent[0]!.text, "“财务报销群”里有人 @ 你。\n小明：@主人 报告发一下\n小明在催报告。");
+      assert.equal(owned.sent[0]!.text, "“财务报销群”里有人 @ 你。\n小明：@主人 报告发一下\n小明在催报告。\n这次没有写草稿，要回复的话请自己回。");
       assert.ok(h.activity.includes("info: 有人 @ 你，准备读取"));
-      assert.ok(h.activity.includes("ok: 读了 2 屏，1 条消息"));
+      assert.ok(h.activity.includes("ok: 读了 2 屏，1 条消息，没有写草稿"));
     });
 
     it("sends the model the pages in order, with the instructions that say they're only material", async () => {
@@ -349,7 +349,8 @@ describe("reading WeChat from the engine", () => {
         h.fake.readBehavior = answer(null);
         await until(() => owned.sent.length === 1, "reminder");
         assert.deepEqual(h.engine.getState().pending, []);
-        assert.ok(h.activity.includes("ok: 读了 2 屏，1 条消息"));
+        assert.ok(h.activity.includes("ok: 读了 2 屏，1 条消息，没有写草稿"));
+        assert.match(owned.sent[0]!.text, /没有写草稿/);
       });
 
       it("uses the summary as the context when no particular message could be picked out", async () => {
