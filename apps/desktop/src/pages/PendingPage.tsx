@@ -1,17 +1,19 @@
 import { useState } from "react";
-import { WECHAT_WORK_CHANNEL_ID, workMessageProblem, type EngineState, type PendingReply } from "@shu/protocol";
+import { WECHAT_WORK_CHANNEL_ID, workMentionProblem, workMessageProblem, type EngineState, type PendingReply } from "@shu/protocol";
 import { formatCost, formatTime, tierLabels } from "../ui.tsx";
 import type { EngineApi } from "../useEngine.ts";
 
 function PendingCard({ reply, engine, state }: { reply: PendingReply; engine: EngineApi; state: EngineState }) {
   const [draft, setDraft] = useState(reply.draft);
   const [copied, setCopied] = useState(false);
+  const [mention, setMention] = useState(reply.mentionName ?? "");
   const trimmed = draft.trim();
+  const mentionName = mention.trim();
   const { running, workbench } = state;
   const isWorkGroup = reply.channelId === WECHAT_WORK_CHANNEL_ID;
   const sending = isWorkGroup && Boolean(workbench?.sending);
   const switchedOff = isWorkGroup && (!running || !workbench?.enabled);
-  const problem = isWorkGroup ? workMessageProblem(trimmed) : null;
+  const problem = isWorkGroup ? (workMessageProblem(trimmed) ?? (mentionName ? workMentionProblem(mentionName) : null)) : null;
   const uncertain = Boolean(reply.sendUncertain);
   const approve = () =>
     engine.send({
@@ -19,6 +21,7 @@ function PendingCard({ reply, engine, state }: { reply: PendingReply; engine: En
       pendingId: reply.id,
       ...(trimmed === reply.draft ? {} : { text: trimmed }),
       ...(uncertain ? { confirmedUnsent: true } : {}),
+      ...(isWorkGroup && mentionName ? { mention: mentionName } : {}),
     });
 
   async function copy() {
@@ -50,6 +53,12 @@ function PendingCard({ reply, engine, state }: { reply: PendingReply; engine: En
         回复草稿
       </label>
       <textarea id={`draft-${reply.id}`} rows={3} value={draft} onChange={(event) => setDraft(event.target.value)} />
+      {isWorkGroup ? (
+        <label className="mention-field">
+          <span className="field-label">同时 @</span>
+          <input className="title-input" value={mention} maxLength={60} placeholder="留空就不 @，名字要和群里显示的完全一样" onChange={(event) => setMention(event.target.value)} />
+        </label>
+      ) : null}
       {isWorkGroup ? (
         <div className="actions">
           <button type="button" className="button button-primary" disabled={switchedOff || sending || problem !== null} onClick={approve}>

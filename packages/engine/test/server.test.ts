@@ -67,7 +67,17 @@ describe("local server", () => {
     await client.opened;
     client.socket.send(JSON.stringify({ type: "pending.approve", pendingId: "draft", text: "改过的", confirmedUnsent: true }));
     await waitFor(() => approve.mock.callCount() === 1);
-    assert.deepEqual(approve.mock.calls[0]!.arguments, ["draft", "改过的", true]);
+    assert.deepEqual(approve.mock.calls[0]!.arguments, ["draft", "改过的", { confirmedUnsent: true }]);
+    client.socket.terminate();
+  });
+
+  it("passes on who the owner wants to mention, tidying the name", async (t) => {
+    const approve = t.mock.method(h.engine, "approve", async () => {});
+    const client = connect(server.port, { origin: ORIGIN });
+    await client.opened;
+    client.socket.send(JSON.stringify({ type: "pending.approve", pendingId: "draft", mention: " 小号 " }));
+    await waitFor(() => approve.mock.callCount() === 1);
+    assert.deepEqual(approve.mock.calls[0]!.arguments, ["draft", undefined, { mention: "小号" }]);
     client.socket.terminate();
   });
 

@@ -116,6 +116,14 @@ export function workMessageProblem(text: string): string | null {
   return null;
 }
 
+// Why this name can't be picked from WeChat's member list. A space closes the list while typing.
+export function workMentionProblem(name: string): string | null {
+  if (/[\s@＠]/.test(name)) return "@ 的名字里不能有空格或 @，这样选不了人。可以留空，复制后自己发。";
+  if (name === "所有人") return "不能 @ 所有人，要的话请自己发。";
+  if (name.length > 40) return "@ 的名字太长了。";
+  return null;
+}
+
 export type PendingReply = {
   id: string;
   channelId: string;
@@ -130,6 +138,8 @@ export type PendingReply = {
   createdAt: number;
   // A try to send this may have gone out, so sending again takes the owner saying it didn't.
   sendUncertain?: boolean;
+  // Who to pick from WeChat's member list when sending. The owner can change it.
+  mentionName?: string;
 };
 
 export type SimSender = { id: string; name: string; tier: Tier };
@@ -204,7 +214,7 @@ export const commandSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("conversation.setEnabled"), channelId: id, conversationId: id, enabled: z.boolean() }),
   z.object({ type: z.literal("conversation.setAutonomy"), channelId: id, conversationId: id, autonomy: z.enum(autonomyLevels) }),
   z.object({ type: z.literal("conversation.rename"), channelId: id, conversationId: id, title: z.string().trim().min(1).max(60) }),
-  z.object({ type: z.literal("pending.approve"), pendingId: id, text: z.string().min(1).max(10000).optional(), confirmedUnsent: z.boolean().optional() }),
+  z.object({ type: z.literal("pending.approve"), pendingId: id, text: z.string().min(1).max(10000).optional(), confirmedUnsent: z.boolean().optional(), mention: z.string().trim().min(1).max(60).optional() }),
   z.object({ type: z.literal("pending.reject"), pendingId: id }),
   z.object({ type: z.literal("pairing.start"), channelId: id, tier: z.enum(grantedTiers) }),
   z.object({ type: z.literal("pairing.cancel") }),

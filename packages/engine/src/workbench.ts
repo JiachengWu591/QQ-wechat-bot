@@ -156,11 +156,11 @@ export class Workbench {
   }
 
   // Waits for any read to finish, and keeps new ones from starting, since both work in the window.
-  async sendDraft(group: string, text: string): Promise<SendOutcome> {
+  async sendDraft(group: string, text: string, mention?: string): Promise<SendOutcome> {
     this.#sending = true;
     try {
       await this.#readFinished;
-      return await this.#screen.sendText(group, text);
+      return await this.#screen.sendText(group, text, mention);
     } finally {
       this.#sending = false;
     }

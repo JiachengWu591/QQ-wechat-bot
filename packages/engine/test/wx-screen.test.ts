@@ -65,6 +65,12 @@ describe("the real sender", windowsOnly, () => {
     const results = await screen.selfTestSend();
     assert.deepEqual(results, {
       state: "ok",
+      // The member Enter would pick.
+      memberBandTop: 38,
+      memberBandBottom: 72,
+      memberSelected: true,
+      otherMemberSelected: false,
+      memberBelowSelection: false,
       // The search result Enter would open.
       nameInBand: true,
       otherNameInBand: false,
@@ -102,9 +108,30 @@ describe("the real sender", windowsOnly, () => {
     });
   });
 
-  it("presses Enter in only two places: on the checked search result, and after every last check", () => {
+  it("only presses Enter on the member list with that exact name selected", () => {
     const source = script("wx-send.ps1");
-    assert.equal([...source.matchAll(/Combo\(\$VK_RETURN\)/g)].length, 2);
+    const select = source.slice(source.indexOf("function Select-Member"), source.indexOf("# Where typed text shows"));
+    const enter = select.indexOf("Combo($VK_RETURN)");
+    assert.ok(enter > 0);
+    const before = (code: string, reason: string) => {
+      const at = select.indexOf(code);
+      assert.ok(at >= 0 && at < enter, reason);
+    };
+    before("if (-not $list) {", "the list has to be open");
+    before("Stop-Send 'mention-no-list'", "or it stops");
+    before("Test-MemberSelected $image $name", "with this name selected");
+    before("if (-not $selected) {", "checked, not just looked at");
+    before("Stop-Send 'mention-not-found'", "or it stops");
+  });
+
+  it("says an emptied box after picking someone may mean it went out, rather than carrying on", () => {
+    const source = script("wx-send.ps1");
+    assert.match(source, /if \(Test-InputEmpty \$image\) \{ throw 'uncertain:mention-sent-early' \}/);
+  });
+
+  it("presses Enter in only three places: the checked search result, the checked member, and after every last check", () => {
+    const source = script("wx-send.ps1");
+    assert.equal([...source.matchAll(/Combo\(\$VK_RETURN\)/g)].length, 3);
     const send = source.indexOf("function Invoke-Send");
     const finalEnter = source.indexOf("Combo($VK_RETURN)", send);
     for (const check of ["Test-InputEmpty $image", "Test-Title (Get-Titles $image) $group", "Test-TypedText $image $text", "Assert-Foreground $window"]) {
@@ -278,6 +305,18 @@ $codes = (($r.group + '|' + $r.text).ToCharArray() | ForEach-Object { [int]$_ })
       } finally {
         delete process.env.SHU_ANTHROPIC_API_KEY;
       }
+    });
+
+    it("passes on who to mention, and leaves it out when there's nobody", async () => {
+      const echo = `$r = ConvertFrom-Json ([Console]::In.ReadLine())
+$codes = ("$($r.mention)".ToCharArray() | ForEach-Object { [int]$_ }) -join ','
+[Console]::Out.WriteLine('{"state":"refused","reason":"' + $codes + '|' + ($null -eq $r.mention) + '"}')`;
+      const named = (await sender(echo).sendText("甲", "乙", "小号")) as { reason: string };
+      const [codes, missing] = named.reason.split("|") as [string, string];
+      assert.equal(String.fromCharCode(...codes.split(",").map(Number)), "小号");
+      assert.equal(missing, "False");
+      const nobody = (await sender(echo).sendText("甲", "乙")) as { reason: string };
+      assert.equal(nobody.reason, "|True");
     });
 
     it("starts a new sender for each send", async () => {

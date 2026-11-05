@@ -572,6 +572,17 @@ textarea {
   font-size: 12px;
 }
 
+.mention-field {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.mention-field .title-input {
+  flex: 1;
+  padding: 4px 8px;
+}
+
 .group-form {
   display: flex;
   gap: 8px;

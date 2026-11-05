@@ -72,7 +72,10 @@ export function startServer(options: ServerOptions): Promise<{ port: number; clo
       case "conversation.setAutonomy":
         return engine.setConversationAutonomy(command.channelId, command.conversationId, command.autonomy);
       case "pending.approve":
-        return engine.approve(command.pendingId, command.text, command.confirmedUnsent);
+        return engine.approve(command.pendingId, command.text, {
+          ...(command.confirmedUnsent ? { confirmedUnsent: true } : {}),
+          ...(command.mention ? { mention: command.mention } : {}),
+        });
       case "pending.reject":
         return engine.reject(command.pendingId);
       case "conversation.rename":

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { workMessageProblem } from "@shu/protocol";
-import { CHAT_READ_SYSTEM, chatReadPrompt, cleanDraft, mentionReminder, parseChatRead, readReminder, sendProblem } from "../src/wx-read.ts";
+import { workMentionProblem, workMessageProblem } from "@shu/protocol";
+import { CHAT_READ_SYSTEM, chatReadPrompt, cleanDraft, mentionReminder, parseChatRead, readReminder, sendProblem, suggestedMention } from "../src/wx-read.ts";
 
 const answer = { messages: [{ sender: "小明", time: "09:30", text: "@主人 报告发一下", fromOwner: false }], mention: { sender: "小明", text: "@主人 报告发一下" }, summary: "小明在催报告。" };
 
@@ -89,9 +89,42 @@ describe("checking a draft before it's sent", () => {
   });
 });
 
+describe("who to mention", () => {
+  it("suggests whoever mentioned the owner", () => {
+    assert.equal(suggestedMention({ ...answer, mention: { sender: " 小号 ", text: "在吗" } }), "小号");
+  });
+
+  it("suggests nobody when it doesn't know who, or the list couldn't be searched for that name", () => {
+    assert.equal(suggestedMention({ ...answer, mention: null }), undefined);
+    assert.equal(suggestedMention({ ...answer, mention: { sender: null, text: "在吗" } }), undefined);
+    assert.equal(suggestedMention({ ...answer, mention: { sender: "张 三", text: "在吗" } }), undefined);
+    assert.equal(suggestedMention({ ...answer, mention: { sender: "所有人", text: "在吗" } }), undefined);
+  });
+
+  it("accepts an ordinary name", () => {
+    assert.equal(workMentionProblem("小号"), null);
+    assert.equal(workMentionProblem("orchidice"), null);
+  });
+
+  it("refuses a space, which closes the list while typing, and an @", () => {
+    assert.match(workMentionProblem("张 三") as string, /空格/);
+    assert.match(workMentionProblem("@小号") as string, /空格或 @/);
+    assert.match(workMentionProblem("＠小号") as string, /空格或 @/);
+  });
+
+  it("refuses everyone, which the list selects by default", () => {
+    assert.match(workMentionProblem("所有人") as string, /所有人/);
+  });
+
+  it("refuses a name too long to be one", () => {
+    assert.match(workMentionProblem("名".repeat(41)) as string, /太长/);
+    assert.equal(workMentionProblem("名".repeat(40)), null);
+  });
+});
+
 describe("explaining why a send stopped", () => {
   it("says a refused send didn't go out", () => {
-    for (const reason of ["bad-text", "owner-busy", "missing", "lost-focus", "input-rejected", "search-failed", "not-top-result", "wrong-chat", "no-input-box", "input-not-empty", "not-typed", "typed-mismatch"]) {
+    for (const reason of ["bad-text", "owner-busy", "missing", "lost-focus", "input-rejected", "search-failed", "not-top-result", "wrong-chat", "no-input-box", "input-not-empty", "not-typed", "typed-mismatch", "mention-no-list", "mention-not-found", "mention-failed"]) {
       assert.match(sendProblem({ state: "refused", reason }), /没有发送/, reason);
     }
   });
@@ -105,6 +138,7 @@ describe("explaining why a send stopped", () => {
       assert.match(sendProblem({ state: "uncertain", reason }), /不确定有没有发出去.*确认没发出去再重试/, reason);
     }
     assert.match(sendProblem({ state: "uncertain", reason: "still-in-input" }), /还在输入框/);
+    assert.match(sendProblem({ state: "uncertain", reason: "mention-sent-early" }), /可能把“@ 名字”单独发出去了/);
   });
 });
 

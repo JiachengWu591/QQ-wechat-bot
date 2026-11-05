@@ -144,6 +144,108 @@ function Open-Group($window, [string]$group) {
     if (-not (Test-OpenChat $window $group)) { Stop-Send 'wrong-chat' }
 }
 
+# The member list that typing @ opens, a separate tool window near the caret.
+function Get-MemberList($window) {
+    $owners = @(Get-Process Weixin -ErrorAction SilentlyContinue | ForEach-Object { $_.Id })
+    foreach ($handle in [Win]::All()) {
+        if ($handle -eq $window.Handle -or -not [Win]::IsWindowVisible($handle)) { continue }
+        $owner = [uint32]0
+        [Win]::GetWindowThreadProcessId($handle, [ref]$owner) | Out-Null
+        if ($owners -notcontains [int]$owner) { continue }
+        $className = New-Object System.Text.StringBuilder 256
+        [Win]::GetClassName($handle, $className, 256) | Out-Null
+        if ("$className" -notlike '*QWindowToolSaveBits') { continue }
+        $rect = New-Object Win+RECT
+        [Win]::GetWindowRect($handle, [ref]$rect) | Out-Null
+        return [pscustomobject]@{ Handle = $handle; Width = $rect.Right - $rect.Left; Height = $rect.Bottom - $rect.Top }
+    }
+    $null
+}
+
+# The row Enter would pick: the first band tall enough to be a row, since the list has no heading
+# above it once a name narrows it down. Unfiltered it's "everyone", so this has to be checked every time.
+function Find-SelectedMember([System.Drawing.Bitmap]$list) {
+    $x = $list.Width - 1
+    $middle = [int]($list.Height / 2)
+    while ($x -gt 0 -and $list.GetPixel($x, $middle).GetBrightness() -lt 0.02) { $x-- }
+    $x -= 8
+    if ($x -le 0) { return $null }
+    $start = 0
+    $color = $list.GetPixel($x, 0)
+    for ($y = 1; $y -le $list.Height; $y++) {
+        $next = if ($y -lt $list.Height) { $list.GetPixel($x, $y) } else { $null }
+        if (-not $next -or $next.ToArgb() -ne $color.ToArgb()) {
+            if ($y - $start -ge 20 -and $color.GetBrightness() -ge 0.02) { return [pscustomobject]@{ Top = $start; Bottom = $y } }
+            $start = $y
+            $color = $next
+        }
+    }
+    $null
+}
+
+# Exact, in any of several reads: the real row read correctly at 1x and at no other scale.
+function Test-MemberSelected([System.Drawing.Bitmap]$list, [string]$name) {
+    $band = Find-SelectedMember $list
+    if (-not $band) { return $false }
+    foreach ($read in @(@(1, $false), @(1, $true), @(2, $false), @(2, $true), @(3, $false), @(3, $true))) {
+        $hit = @(Read-Lines $list $read[0] $read[1] | Where-Object { $_.Text -ceq $name -and $_.Y -ge $band.Top - 5 -and $_.Y -lt $band.Bottom })
+        if ($hit.Count) { return $true }
+    }
+    $false
+}
+
+function Close-MemberList($window) {
+    [Keys]::Combo($VK_ESCAPE)
+    Start-Sleep -Milliseconds 300
+    Clear-Typed $window
+}
+
+# A real mention has to be picked from the list: typed out in full it's plain text. This Enter is the
+# dangerous one, because with no list open it would send what's in the box. So it only happens with
+# the list open and this exact name selected, and everything else stops and clears the box.
+function Select-Member($window, [string]$name) {
+    # The list takes a moment to open, and a name typed straight after @ can beat it.
+    Send-Text $window '@'
+    $list = $null
+    for ($wait = 0; $wait -lt 15 -and -not $list; $wait++) {
+        Start-Sleep -Milliseconds 100
+        $list = Get-MemberList $window
+    }
+    if ($list) {
+        Send-Text $window $name
+        Start-Sleep -Milliseconds 800
+        $list = Get-MemberList $window
+    }
+    if (-not $list) {
+        Clear-Typed $window
+        Stop-Send 'mention-no-list'
+    }
+    $image = Get-WindowImage $list
+    $selected = $false
+    if ($image) {
+        try { $selected = Test-MemberSelected $image $name } finally { $image.Dispose() }
+    }
+    if (-not $selected) {
+        Close-MemberList $window
+        Stop-Send 'mention-not-found'
+    }
+
+    Assert-Foreground $window
+    [Keys]::Combo($VK_RETURN)
+    Start-Sleep -Milliseconds 500
+
+    if (Get-MemberList $window) {
+        Close-MemberList $window
+        Stop-Send 'mention-failed'
+    }
+    $image = Get-WindowImage $window
+    if (-not $image) { Clear-Typed $window; Stop-Send 'missing' }
+    try {
+        # The name should now be in the box. If the box is empty, that Enter sent it.
+        if (Test-InputEmpty $image) { throw 'uncertain:mention-sent-early' }
+    } finally { $image.Dispose() }
+}
+
 # Where typed text shows: inside the input box, above the row of icons and the send button.
 function Get-InputArea([System.Drawing.Bitmap]$image) {
     $box = Find-InputBox $image
@@ -245,8 +347,9 @@ function Restore-Foreground($window, [IntPtr]$previous) {
     }
 }
 
-function Invoke-Send([string]$group, [string]$text, [bool]$rehearse) {
+function Invoke-Send([string]$group, [string]$text, [bool]$rehearse, [string]$mention) {
     if (-not $group -or -not $text.Trim() -or $text -match '[\x00-\x1F]') { Stop-Send 'bad-text' }
+    if ($mention -match '[\x00-\x20@]') { Stop-Send 'bad-text' }
 
     # So nothing the owner is typing lands in the chat, and they have a moment to take their hands off.
     $deadline = (Get-Date).AddSeconds($IDLE_WAIT_SECONDS)
@@ -284,6 +387,8 @@ function Invoke-Send([string]$group, [string]$text, [bool]$rehearse) {
             Send-Click $window ($area.Left + [int]($area.Width / 2)) ($area.Top + [int]($area.Height / 2))
         } finally { $image.Dispose() }
         Start-Sleep -Milliseconds 200
+
+        if ($mention) { Select-Member $window $mention }
 
         Send-Text $window $text
         Start-Sleep -Milliseconds 500
@@ -398,6 +503,33 @@ function Invoke-SelfTest {
         $results.latinNotHeldAgainst = Test-MessageShown $window 'hello world'
     } finally { $window.Dispose() }
 
+    # The member list as measured on real WeChat: a transparent margin, one selected row, a sliver
+    # of background under it. Unfiltered, the selected row is "everyone", with others below it.
+    function New-MemberList([int]$height, [string]$rowText, [int]$rowY) {
+        $list = New-Object System.Drawing.Bitmap 273, $height
+        $graphics = [System.Drawing.Graphics]::FromImage($list)
+        $graphics.Clear([System.Drawing.Color]::Black)
+        $back = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(238, 238, 240))
+        $selected = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(213, 213, 215))
+        $graphics.FillRectangle($back, 30, 30, 213, $height - 60)
+        $graphics.FillRectangle($selected, 30, 38, 213, 34)
+        $graphics.DrawString($rowText, $font, [System.Drawing.Brushes]::Black, 78, $rowY)
+        $graphics.Dispose()
+        $list
+    }
+    $other = Text 0x8D22, 0x52A1, 0x62A5, 0x9500, 0x7FA4
+    $list = New-MemberList 110 $name 44
+    try {
+        $band = Find-SelectedMember $list
+        $results.memberBandTop = $band.Top
+        $results.memberBandBottom = $band.Bottom
+        $results.memberSelected = Test-MemberSelected $list $name
+        $results.otherMemberSelected = Test-MemberSelected $list $other
+    } finally { $list.Dispose() }
+    # The name is in the list, but it isn't the row Enter would pick.
+    $list = New-MemberList 215 $name 110
+    try { $results.memberBelowSelection = Test-MemberSelected $list $name } finally { $list.Dispose() }
+
     # What real reads of real text looked like, which must pass, and how far a wrong text gets.
     $typed = Text 0x67A2, 0x53D1, 0x9001, 0x6D4B, 0x8BD5
     $misread = (Text 0x67A2, 0x53D1, 0x9009, 0x5290, 0x8BA0, 0x9172) + (Text 0x67A2, 0x53D1, 0x8FD9, 0x5219) + (Text 0x6C14, 0x90FD, 0x8BD5) + '2'
@@ -421,7 +553,7 @@ function Invoke-SelfTest {
 try {
     $request = ConvertFrom-Json ([Console]::In.ReadLine())
     $reply = switch ($request.command) {
-        'send' { Invoke-Send $request.group $request.text ($request.rehearse -eq $true) }
+        'send' { Invoke-Send $request.group $request.text ($request.rehearse -eq $true) "$($request.mention)" }
         'selftest' { Invoke-SelfTest }
         default { throw "unknown command: $($request.command)" }
     }
@@ -429,5 +561,6 @@ try {
 } catch {
     $message = "$($_.Exception.Message)"
     if ($message -like 'stop:*') { Write-Reply @{ state = 'refused'; reason = $message.Substring(5) } }
+    elseif ($message -like 'uncertain:*') { Write-Reply @{ state = 'uncertain'; reason = $message.Substring(10) } }
     else { Write-Reply @{ error = $message } }
 }

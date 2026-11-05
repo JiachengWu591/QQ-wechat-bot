@@ -33,8 +33,9 @@ export interface WeChatScreen {
   openRow(y: number): Promise<OpenedRow>;
   // The open chat, oldest page first.
   captureChat(options: { pages: number; postsPerPage: number }): Promise<ChatCapture>;
-  // Types into that group's chat and sends. Takes the foreground for as long as that takes.
-  sendText(group: string, text: string): Promise<SendOutcome>;
+  // Types into that group's chat and sends. Takes the foreground for as long as that takes. A mention
+  // picks this exact name from WeChat's member list first, or stops.
+  sendText(group: string, text: string, mention?: string): Promise<SendOutcome>;
   stop(): Promise<void>;
 }
 
@@ -77,14 +78,15 @@ export class WxHelperScreen implements WeChatScreen {
     this.#sendTimeoutMs = options.sendTimeoutMs ?? SEND_TIMEOUT_MS;
   }
 
-  sendText(group: string, text: string): Promise<SendOutcome> {
-    return this.#runSender({ command: "send", group, text });
+  sendText(group: string, text: string, mention?: string): Promise<SendOutcome> {
+    return this.#runSender({ command: "send", group, text, ...(mention ? { mention } : {}) });
   }
 
-  // Everything up to pressing Enter, then it clears what it typed. For trying the sender out against
-  // a real WeChat window. Nothing in the engine calls this.
-  rehearseSend(group: string, text: string): Promise<SendOutcome> {
-    return this.#runSender({ command: "send", group, text, rehearse: true });
+  // Everything up to the final Enter, then it clears what it typed. For trying the sender out against
+  // a real WeChat window. Nothing in the engine calls this. With a mention it does press Enter once,
+  // on the member list.
+  rehearseSend(group: string, text: string, mention?: string): Promise<SendOutcome> {
+    return this.#runSender({ command: "send", group, text, rehearse: true, ...(mention ? { mention } : {}) });
   }
 
   selfTestSend(): Promise<Record<string, unknown>> {

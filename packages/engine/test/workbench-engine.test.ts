@@ -28,11 +28,11 @@ class FakeScreen implements WeChatScreen {
     return { state: "ok", pages: [{ image: Buffer.from("older"), titles: [this.title] }, { image: Buffer.from("newer"), titles: [this.title] }], reachedTop: false, interrupted: false };
   }
 
-  sends: { group: string; text: string }[] = [];
+  sends: { group: string; text: string; mention?: string }[] = [];
   sendAnswer: () => Promise<SendOutcome> = async () => ({ state: "sent" });
 
-  async sendText(group: string, text: string) {
-    this.sends.push({ group, text });
+  async sendText(group: string, text: string, mention?: string) {
+    this.sends.push({ group, text, ...(mention ? { mention } : {}) });
     return this.sendAnswer();
   }
 
@@ -465,7 +465,7 @@ describe("reading WeChat from the engine", () => {
           await assert.rejects(h.engine.approve(id, "改过的"), /请先看一下微信/);
           assert.equal(screen.sends.length, 1);
 
-          await h.engine.approve(id, undefined, true);
+          await h.engine.approve(id, undefined, { confirmedUnsent: true });
           assert.equal(screen.sends.length, 2);
           assert.deepEqual(h.engine.getState().pending, []);
         });
@@ -500,7 +500,7 @@ describe("reading WeChat from the engine", () => {
           screen.sendAnswer = async () => ({ state: "uncertain", reason: "not-shown" });
           await assert.rejects(h.engine.approve(id), /不确定/);
           screen.sendAnswer = async () => ({ state: "refused", reason: "wrong-chat" });
-          await assert.rejects(h.engine.approve(id, undefined, true), /没有发送/);
+          await assert.rejects(h.engine.approve(id, undefined, { confirmedUnsent: true }), /没有发送/);
           assert.equal(h.engine.getState().pending[0]!.sendUncertain, true);
         });
 
@@ -518,10 +518,53 @@ describe("reading WeChat from the engine", () => {
           await assert.rejects(h.engine.approve(id), /请先看一下微信/);
         });
 
-        it("won't send a draft with an @", async () => {
+        it("won't send a draft with an @ typed into it", async () => {
           const id = await drafted();
           await assert.rejects(h.engine.approve(id, "收到 @小号"), /@/);
           assert.deepEqual(screen.sends, []);
+        });
+
+        it("suggests mentioning whoever mentioned the owner, without doing it unasked", async () => {
+          const id = await drafted();
+          assert.equal(h.engine.getState().pending[0]!.mentionName, "小明");
+          await h.engine.approve(id);
+          assert.deepEqual(screen.sends, [{ group: "财务报销群", text: "周五前发你。" }]);
+        });
+
+        it("mentions who the owner says, and logs it", async () => {
+          const id = await drafted();
+          await h.engine.approve(id, undefined, { mention: "小红" });
+          assert.deepEqual(screen.sends, [{ group: "财务报销群", text: "周五前发你。", mention: "小红" }]);
+          assert.ok(h.activity.includes("ok: 已发到群里：@小红 周五前发你。"));
+        });
+
+        it("won't try to mention everyone, or a name the list can't be searched for", async () => {
+          const id = await drafted();
+          await assert.rejects(h.engine.approve(id, undefined, { mention: "所有人" }), /所有人/);
+          await assert.rejects(h.engine.approve(id, undefined, { mention: "张 三" }), /空格/);
+          assert.deepEqual(screen.sends, []);
+          assert.equal(h.engine.getState().pending.length, 1);
+        });
+
+        it("keeps the draft and says why when the person can't be picked", async () => {
+          const id = await drafted();
+          screen.sendAnswer = async () => ({ state: "refused", reason: "mention-not-found" });
+          await assert.rejects(h.engine.approve(id, undefined, { mention: "小红" }), /选中的不是这个人，已清空，没有发送/);
+          assert.equal(h.engine.getState().pending[0]!.sendUncertain, undefined);
+        });
+
+        it("treats the picking Enter sending the box as uncertain", async () => {
+          const id = await drafted();
+          screen.sendAnswer = async () => ({ state: "uncertain", reason: "mention-sent-early" });
+          await assert.rejects(h.engine.approve(id, undefined, { mention: "小红" }), /不确定.*单独发出去/);
+          assert.equal(h.engine.getState().pending[0]!.sendUncertain, true);
+        });
+
+        it("keeps a suggested name through an uncertain send", async () => {
+          const id = await drafted();
+          screen.sendAnswer = async () => ({ state: "uncertain", reason: "not-shown" });
+          await assert.rejects(h.engine.approve(id), /不确定/);
+          assert.equal(h.engine.getState().pending[0]!.mentionName, "小明");
         });
 
         it("takes the owner's word through the console's command", () => {

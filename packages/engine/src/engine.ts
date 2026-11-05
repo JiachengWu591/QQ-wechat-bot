@@ -1,7 +1,7 @@
 // The hub: everything a message goes through between arriving and a reply leaving.
 import { EventEmitter } from "node:events";
 import { randomInt, randomUUID } from "node:crypto";
-import { modelOptions, WECHAT_WORK_CHANNEL_ID, workMessageProblem } from "@shu/protocol";
+import { modelOptions, WECHAT_WORK_CHANNEL_ID, workMentionProblem, workMessageProblem } from "@shu/protocol";
 import type {
   AccessEntry,
   ActivityEntry,
@@ -29,7 +29,7 @@ import type { LocalTool, ToolContext } from "./tools.ts";
 import type { Adapter, AdapterConversation, AdapterMessage } from "./types.ts";
 import { confusableGroup, normalizeGroupName, Workbench, type ChatReading, type WorkbenchMention } from "./workbench.ts";
 import type { Workspace } from "./workspace.ts";
-import { CHAT_READ_SYSTEM, chatReadPrompt, cleanDraft, mentionReminder, parseChatRead, readReminder, sendProblem, type ChatRead } from "./wx-read.ts";
+import { CHAT_READ_SYSTEM, chatReadPrompt, cleanDraft, mentionReminder, parseChatRead, readReminder, sendProblem, suggestedMention, type ChatRead } from "./wx-read.ts";
 import type { WeChatScreen } from "./wx-screen.ts";
 
 export type EngineConfig = {
@@ -351,7 +351,9 @@ export class Engine extends EventEmitter<EngineEvents> {
     for (const reply of this.#store.listPending()) {
       if (reply.channelId === WECHAT_WORK_CHANNEL_ID && reply.conversationId === group) this.#store.removePending(reply.id);
     }
+    const mention = suggestedMention(read);
     this.#store.addPending({
+      ...(mention ? { mentionName: mention } : {}),
       id: randomUUID(),
       channelId: WECHAT_WORK_CHANNEL_ID,
       conversationId: group,
@@ -594,10 +596,10 @@ export class Engine extends EventEmitter<EngineEvents> {
     return received;
   }
 
-  async approve(pendingId: string, editedText?: string, confirmedUnsent?: boolean) {
+  async approve(pendingId: string, editedText?: string, options: { confirmedUnsent?: boolean; mention?: string } = {}) {
     const reply = this.#store.listPending().find((entry) => entry.id === pendingId);
     if (!reply) throw new Error("这条待确认的回复已经不存在了。");
-    if (reply.channelId === WECHAT_WORK_CHANNEL_ID) return this.#sendWorkDraft(reply, editedText ?? reply.draft, confirmedUnsent === true);
+    if (reply.channelId === WECHAT_WORK_CHANNEL_ID) return this.#sendWorkDraft(reply, editedText ?? reply.draft, options);
     if (!this.#canSend(reply.channelId, reply.conversationId)) {
       throw new Error("总闸或这个聊天已关闭，打开后才能发送。");
     }
@@ -609,11 +611,11 @@ export class Engine extends EventEmitter<EngineEvents> {
 
   // Only ever from the owner approving this draft in the console. Nothing here retries: a message
   // that may have gone out can't be sent again without the owner saying they've looked.
-  async #sendWorkDraft(reply: PendingReply, text: string, confirmedUnsent: boolean) {
+  async #sendWorkDraft(reply: PendingReply, text: string, { confirmedUnsent, mention }: { confirmedUnsent?: boolean; mention?: string }) {
     if (!this.#workbench || !this.#running || !this.#workbenchEnabled()) throw new Error("总闸或微信工作群开关已关闭，打开后才能发送。");
     const group = reply.conversationId;
     if (!this.#allowedGroups().includes(group)) throw new Error("这个群已经不在允许名单里了，没有发送。");
-    const problem = workMessageProblem(text);
+    const problem = workMessageProblem(text) ?? (mention ? workMentionProblem(mention) : null);
     if (problem) throw new Error(problem);
     if (this.#workbenchSending) throw new Error("正在发送另一条，等它结束再试。");
     if (reply.sendUncertain && !confirmedUnsent) throw new Error("上一次不确定有没有发出去，请先看一下微信，确认没发出去再发。");
@@ -623,7 +625,7 @@ export class Engine extends EventEmitter<EngineEvents> {
     try {
       let outcome;
       try {
-        outcome = await this.#workbench.sendDraft(group, text);
+        outcome = await this.#workbench.sendDraft(group, text, mention);
       } catch (error) {
         // It was stopped or fell over part way, which could have been just after pressing Enter.
         this.#markSendUncertain(reply, text);
@@ -637,7 +639,7 @@ export class Engine extends EventEmitter<EngineEvents> {
         throw new Error(message);
       }
       this.#store.removePending(reply.id);
-      this.#log("ok", `已发到群里：${preview(text)}`, group);
+      this.#log("ok", `已发到群里：${mention ? `@${mention} ` : ""}${preview(text)}`, group);
     } finally {
       this.#workbenchSending = false;
       this.#emitState();

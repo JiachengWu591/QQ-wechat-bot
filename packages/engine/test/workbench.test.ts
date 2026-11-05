@@ -37,8 +37,8 @@ class FakeScreen implements WeChatScreen {
   sends: string[] = [];
   sendAnswer: SendOutcome | Promise<SendOutcome> = { state: "sent" };
 
-  async sendText(group: string, text: string): Promise<SendOutcome> {
-    this.sends.push(`${group}: ${text}`);
+  async sendText(group: string, text: string, mention?: string): Promise<SendOutcome> {
+    this.sends.push(`${group}: ${mention ? `@${mention} ` : ""}${text}`);
     return this.sendAnswer;
   }
 
@@ -546,6 +546,12 @@ describe("watching for mentions", () => {
         screen.sendAnswer = { state: "refused", reason: "wrong-chat" };
         assert.deepEqual(await workbench.sendDraft("项目周会群", "收到"), { state: "refused", reason: "wrong-chat" });
         assert.deepEqual(screen.sends, ["项目周会群: 收到"]);
+      });
+
+      it("passes on who to mention", async () => {
+        start(nothing);
+        await workbench.sendDraft("项目周会群", "收到", "小号");
+        assert.deepEqual(screen.sends, ["项目周会群: @小号 收到"]);
       });
 
       it("opens nothing, since both would be working in the same window", async () => {

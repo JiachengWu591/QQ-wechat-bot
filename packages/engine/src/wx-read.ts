@@ -1,6 +1,7 @@
 // Turns screenshots of a work group into something the owner can act on. Everything on those
 // screens was written by other people, so the model reading them gets no tools, and what it says
 // only ever goes to the owner.
+import { workMentionProblem } from "@shu/protocol";
 import { z } from "zod";
 
 const MAX_GROUP_CHARS = 40;
@@ -67,6 +68,9 @@ const REFUSALS: Record<string, string> = {
   "not-top-result": "搜索结果第一行不是这个群，没有发送。请先在微信里点开这个群再试。",
   "wrong-chat": "打开的聊天标题对不上，没有发送。",
   "no-input-box": "找不到微信的输入框，没有发送。",
+  "mention-no-list": "打 @ 后成员列表没有弹出来，已清空，没有发送。",
+  "mention-not-found": "成员列表里选中的不是这个人，已清空，没有发送。可以改一下名字，或者复制后自己发。",
+  "mention-failed": "没能从成员列表选中这个人，已清空，没有发送。",
   "input-not-empty": "这个群的输入框里有没发的文字，没有发送，免得一起发出去。请先处理掉。",
   "not-typed": "文字没有打进输入框，没有发送。",
   "typed-mismatch": "输入框里的文字和草稿对不上，已清空，没有发送。",
@@ -77,12 +81,20 @@ const UNCERTAIN: Record<string, string> = {
   "no-capture": "已按回车，但截不到微信窗口。",
   "still-in-input": "已按回车，但文字还在输入框里。",
   "not-shown": "已按回车，但在聊天里没读到这条消息。",
+  "mention-sent-early": "选人时按回车后输入框空了，可能把“@ 名字”单独发出去了。",
 };
 
 export function sendProblem(outcome: { state: string; reason?: string }): string {
   const reason = outcome.reason ?? "";
   if (outcome.state === "refused") return REFUSALS[reason] ?? `没有发送（${reason}）。`;
   return `不确定有没有发出去。${UNCERTAIN[reason] ?? ""}请看一下微信，确认没发出去再重试。`;
+}
+
+// Who to suggest picking from the member list: whoever mentioned the owner, if that's a name the
+// list could be searched for.
+export function suggestedMention(read: ChatRead): string | undefined {
+  const name = read.mention?.sender?.trim();
+  return name && !workMentionProblem(name) ? name : undefined;
 }
 
 // A line break in WeChat's input box sends the message, so a draft stays on one line. The model can
