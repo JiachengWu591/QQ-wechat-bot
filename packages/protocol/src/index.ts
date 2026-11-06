@@ -189,6 +189,8 @@ export type EngineState = {
     searchLimit: number;
   };
   brain: { ready: boolean; model: string };
+  // Whether the master switch comes on by itself when the app starts with Windows.
+  runAtLogin: boolean;
   simSenders: SimSender[];
   access: AccessEntry[];
   pairing: PairingView | null;
@@ -206,6 +208,7 @@ const id = z.string().min(1).max(200);
 export const commandSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("engine.start") }),
   z.object({ type: z.literal("engine.stop") }),
+  z.object({ type: z.literal("engine.setRunAtLogin"), enabled: z.boolean() }),
   z.object({ type: z.literal("brain.setModel"), model: z.enum(modelIds) }),
   z.object({ type: z.literal("channel.setEnabled"), channelId: id, enabled: z.boolean() }),
   z.object({ type: z.literal("channel.login"), channelId: id }),

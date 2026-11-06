@@ -2,6 +2,8 @@ node_modules/
 dist/
 target/
 apps/desktop/src-tauri/gen/
+# The bundled engine and the Node it ships with, built for the installer
+apps/desktop/src-tauri/engine/
 *.tsbuildinfo
 
 # Local dev data, including chat text

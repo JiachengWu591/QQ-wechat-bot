@@ -8,11 +8,46 @@ use std::thread;
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter};
 
-// The app runs from this checkout for now. It's only used on this machine; a standalone
-// install would need to bundle Node and the engine instead.
-const REPO_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../..");
 const ALLOWED_ORIGINS: &str = "http://tauri.localhost,tauri://localhost,http://127.0.0.1:5173";
 const MAX_QUICK_FAILURES: u32 = 5;
+
+/// What the engine runs from and where its data is. A development build runs it from this
+/// checkout. An installed one runs what the installer put beside the app, its own Node included,
+/// and needs nothing from here. Its data and its keys live in the app's own data folder,
+/// %LOCALAPPDATA%\com.shu.console, not with the program in %LOCALAPPDATA%\Shu, which an update
+/// or uninstall rewrites. Uninstalling removes the data only if the owner ticks that box.
+pub struct Launch {
+    node: PathBuf,
+    dir: PathBuf,
+    script: &'static str,
+    env_file: PathBuf,
+    data_dir: PathBuf,
+    /// Only the first engine started after Windows started the app is told so.
+    at_login: bool,
+}
+
+impl Launch {
+    #[cfg(debug_assertions)]
+    pub fn new(_app: &AppHandle, at_login: bool) -> tauri::Result<Self> {
+        let root = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../.."));
+        Ok(Self {
+            node: PathBuf::from("node"),
+            dir: root.join("packages/engine"),
+            script: "src/main.ts",
+            env_file: root.join("spikes/.env.local"),
+            data_dir: root.join(".dev/data"),
+            at_login,
+        })
+    }
+
+    #[cfg(not(debug_assertions))]
+    pub fn new(app: &AppHandle, at_login: bool) -> tauri::Result<Self> {
+        use tauri::Manager;
+        let dir = app.path().resource_dir()?.join("engine");
+        let data_dir = app.path().app_local_data_dir()?;
+        Ok(Self { node: dir.join("node.exe"), dir, script: "engine.mjs", env_file: data_dir.join(".env.local"), data_dir, at_login })
+    }
+}
 
 #[derive(Clone, Serialize)]
 pub struct Connection {
@@ -42,29 +77,30 @@ pub fn tie_children_to_this_process() -> Result<(), win32job::JobError> {
     Ok(())
 }
 
-fn start(connection: &Connection) -> std::io::Result<Child> {
-    let root = PathBuf::from(REPO_ROOT);
-    let mut command = Command::new("node");
+fn start(connection: &Connection, launch: &Launch, at_login: bool) -> std::io::Result<Child> {
+    let mut command = Command::new(&launch.node);
     command
-        .current_dir(root.join("packages/engine"))
+        .current_dir(&launch.dir)
         .arg("--disable-warning=ExperimentalWarning")
-        .arg(format!("--env-file-if-exists={}", root.join("spikes/.env.local").display()))
-        .arg("src/main.ts")
+        .arg(format!("--env-file-if-exists={}", launch.env_file.display()))
+        .arg(launch.script)
         .env("SHU_ENGINE_PORT", connection.port.to_string())
         .env("SHU_ENGINE_TOKEN", &connection.token)
-        .env("SHU_ALLOWED_ORIGINS", ALLOWED_ORIGINS);
+        .env("SHU_ALLOWED_ORIGINS", ALLOWED_ORIGINS)
+        .env("SHU_DATA_DIR", &launch.data_dir);
 
     // A session started from inside Claude passes on its own login, which would otherwise
-    // override the credentials the engine is meant to use.
+    // override the credentials the engine is meant to use. Nothing from outside may say the
+    // app started with Windows either: only this process knows that.
     for (name, _) in std::env::vars() {
         let upper = name.to_uppercase();
-        if upper.starts_with("ANTHROPIC_") || upper.starts_with("CLAUDE") || upper.contains("OAUTH") {
+        if upper.starts_with("ANTHROPIC_") || upper.starts_with("CLAUDE") || upper.contains("OAUTH") || upper == "SHU_LAUNCHED_AT_LOGIN" {
             command.env_remove(name);
         }
     }
-
-    #[cfg(debug_assertions)]
-    command.env("SHU_DATA_DIR", root.join(".dev/data"));
+    if at_login {
+        command.env("SHU_LAUNCHED_AT_LOGIN", "1");
+    }
 
     #[cfg(not(debug_assertions))]
     {
@@ -77,13 +113,17 @@ fn start(connection: &Connection) -> std::io::Result<Child> {
 }
 
 /// Keeps the engine running. A restarted engine comes up stopped, so a crash can never
-/// switch the bot back on by itself. Gives up after repeated quick failures.
-pub fn supervise(connection: Connection, app: AppHandle) {
+/// switch the bot back on by itself: only the first one hears that the app started with
+/// Windows, which may turn it on if the owner asked for that. Gives up after repeated quick
+/// failures.
+pub fn supervise(connection: Connection, launch: Launch, app: AppHandle) {
     thread::spawn(move || {
         let mut quick_failures = 0;
+        let mut at_login = launch.at_login;
         loop {
             let started = Instant::now();
-            match start(&connection).and_then(|mut child| child.wait()) {
+            let first = std::mem::replace(&mut at_login, false);
+            match start(&connection, &launch, first).and_then(|mut child| child.wait()) {
                 Ok(status) => eprintln!("engine exited: {status}"),
                 Err(error) => eprintln!("engine failed to start: {error}"),
             }

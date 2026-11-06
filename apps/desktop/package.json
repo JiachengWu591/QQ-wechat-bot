@@ -5,6 +5,7 @@
   "scripts": {
     "build": "vite build",
     "tauri": "tauri",
+    "package": "tauri build --config src-tauri/tauri.package.json",
     "typecheck": "tsc -p tsconfig.json"
   },
   "dependencies": {

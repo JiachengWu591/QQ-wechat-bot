@@ -26,7 +26,28 @@ pnpm dev
 
 然后打开 <http://127.0.0.1:5173>。
 
-API key 从 `spikes/.env.local` 读取；没有 key 也能启动，只是 bot 无法回复。开发数据在 `.dev/`，不会进 git。程序目前直接从这个目录运行，电脑上要有 Node，还没有做独立安装包。
+API key 从 `spikes/.env.local` 读取；没有 key 也能启动，只是 bot 无法回复。开发数据在 `.dev/`，不会进 git。
+
+### 安装包
+
+```bash
+pnpm package
+```
+
+生成 `apps/desktop/src-tauri/target/release/bundle/nsis/Shu_0.1.0_x64-setup.exe`，约 25 MB。安装只装给当前用户，不需要管理员权限。
+
+在从开始菜单打开的终端里安装：
+
+```bash
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\install.ps1
+```
+
+第一次安装时，它会把开发版的数据和 `spikes\.env.local` 复制到装好的版本的数据目录（已经有就不动），然后静默安装并启动。不要在 Claude 这类打包应用的终端里运行：Windows 会把它在 AppData 下写的东西都转到那个应用自己的容器里，别的程序看不到，开机启动也不生效。脚本发现在这种终端里会直接停下。
+
+- 安装包里带了打成一个文件的引擎和它要用的 Node（打包时用本机的 Node，至少 24 版），装好后不再需要这个目录，也不需要电脑上装 Node。打包时会在装好的 Node 上先跑一遍冒烟测试：SQLite、Excel、Word、图片切分和读微信窗口的脚本。
+- 程序装在 `%LOCALAPPDATA%\Shu`。数据在另一个地方，`%LOCALAPPDATA%\com.shu.console`，key 从那里的 `.env.local` 读，和开发版的 `.dev/` 是两份。卸载时只有勾选删除应用数据才会删掉数据。两个版本不能同时开：后开的那个只会把先开的窗口叫出来。
+- 控制台的“开机启动”打开后，登录 Windows 时自动启动，窗口不弹出来，在托盘里。另有“启动后自动打开总闸”，默认关着；引擎出错重启后总闸总是关的。开发版不能设开机启动。
+- 改了代码要重新打包、重新安装才会生效。
 
 可以用环境变量调整的设置：
 

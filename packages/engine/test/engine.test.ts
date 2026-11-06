@@ -142,6 +142,26 @@ describe("what a turn is allowed to do", () => {
 });
 
 describe("the master switch", () => {
+  it("stays off when the app starts with Windows, unless the owner asked for it to come on", async () => {
+    const h = harness();
+    assert.equal(h.engine.getState().runAtLogin, false);
+    await h.engine.startAtLogin();
+    assert.equal(h.engine.getState().running, false);
+    assert.ok(h.activity.some((line) => /总闸保持关闭/.test(line)));
+
+    h.engine.setRunAtLogin(true);
+    assert.equal(h.engine.getState().runAtLogin, true);
+    await h.engine.startAtLogin();
+    assert.equal(h.engine.getState().running, true);
+  });
+
+  it("remembers whether it comes on at login across restarts", () => {
+    const h = harness();
+    h.engine.setRunAtLogin(true);
+    const again = harness({ store: h.store });
+    assert.equal(again.engine.getState().runAtLogin, true);
+  });
+
   it("doesn't answer while stopped", async () => {
     const h = harness();
     await h.engine.handleInbound(h.message(MEMBER, GROUP, "在吗"));

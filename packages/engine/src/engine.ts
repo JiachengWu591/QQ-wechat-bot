@@ -193,6 +193,7 @@ export class Engine extends EventEmitter<EngineEvents> {
         searchLimit: this.#config.sharedSearchesPerDay,
       },
       brain: { ready: this.#brain !== null, model: this.#selectedModel() ?? "未配置" },
+      runAtLogin: this.#runAtLogin(),
       simSenders: this.#config.simSenders,
       access: this.#pairedAccess(),
       pairing: this.#activePairing(),
@@ -228,6 +229,24 @@ export class Engine extends EventEmitter<EngineEvents> {
     this.#emitState();
     await Promise.allSettled([...[...this.#adapters.values()].map((adapter) => adapter.stop()), this.#workbench?.stop()]);
     this.#emitState();
+  }
+
+  #runAtLogin(): boolean {
+    return this.#store.getSetting<boolean>("engine:runAtLogin") ?? false;
+  }
+
+  setRunAtLogin(enabled: boolean) {
+    this.#store.setSetting("engine:runAtLogin", enabled);
+    this.#log("info", enabled ? "开机启动后会自动打开总闸" : "开机启动后总闸保持关闭");
+    this.#emitState();
+  }
+
+  // Only when the app itself was started with Windows, and only the first engine of that run: one
+  // restarted after a crash comes up stopped, whatever this says.
+  async startAtLogin() {
+    if (!this.#runAtLogin()) return this.#log("info", "开机启动了，总闸保持关闭");
+    await this.start();
+    this.#log("info", "开机启动，按设置自动打开了总闸");
   }
 
   #workbenchEnabled(): boolean {

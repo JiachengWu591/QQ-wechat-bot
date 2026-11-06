@@ -4,6 +4,7 @@
   "type": "module",
   "scripts": {
     "start": "node --disable-warning=ExperimentalWarning src/main.ts",
+    "bundle": "node scripts/bundle.mjs --smoke",
     "test": "node --disable-warning=ExperimentalWarning --test \"test/*.test.ts\"",
     "typecheck": "tsc -p tsconfig.json"
   },
@@ -20,6 +21,7 @@
   "devDependencies": {
     "@types/node": "^24.0.0",
     "@types/ws": "^8.18.0",
+    "esbuild": "0.25.12",
     "jszip": "^3.10.2",
     "typescript": "^5.9.0"
   }

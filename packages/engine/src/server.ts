@@ -57,6 +57,8 @@ export function startServer(options: ServerOptions): Promise<{ port: number; clo
         return engine.start();
       case "engine.stop":
         return engine.stop();
+      case "engine.setRunAtLogin":
+        return engine.setRunAtLogin(command.enabled);
       case "brain.setModel":
         return engine.setModel(command.model);
       case "channel.setEnabled":

@@ -76,6 +76,9 @@ const server = await startServer({
 });
 console.log(`engine listening on 127.0.0.1:${server.port}, model ${brain?.model ?? "not configured"}`);
 
+// Set by the desktop app for the first engine it starts after Windows started it, and no other.
+if (process.env.SHU_LAUNCHED_AT_LOGIN === "1") await engine.startAtLogin();
+
 async function shutdown() {
   await engine.stop();
   await server.close();

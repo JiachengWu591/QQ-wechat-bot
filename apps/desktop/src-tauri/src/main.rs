@@ -2,7 +2,8 @@
 
 mod engine;
 
-use engine::Connection;
+use engine::{Connection, Launch};
+use serde::Serialize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::{
     image::Image,
@@ -10,9 +11,38 @@ use tauri::{
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     AppHandle, Emitter, Manager, State, WebviewWindow, WindowEvent, Wry,
 };
+use tauri_plugin_autostart::ManagerExt;
 
 const TRAY_ON: &[u8] = include_bytes!("../icons/tray-on.png");
 const TRAY_OFF: &[u8] = include_bytes!("../icons/tray-off.png");
+// What Windows starts the app with when it starts the app at login.
+const AT_LOGIN_ARG: &str = "--autostart";
+
+#[derive(Serialize)]
+struct Autostart {
+    // A development build runs from this checkout, which isn't what Windows should start.
+    available: bool,
+    enabled: bool,
+}
+
+#[tauri::command]
+fn autostart_state(app: AppHandle) -> Autostart {
+    if cfg!(debug_assertions) {
+        return Autostart { available: false, enabled: false };
+    }
+    Autostart { available: true, enabled: app.autolaunch().is_enabled().unwrap_or(false) }
+}
+
+#[tauri::command]
+fn set_autostart(app: AppHandle, enabled: bool) -> Result<Autostart, String> {
+    if cfg!(debug_assertions) {
+        return Err("开发版不能设开机启动，装好的版本才可以。".into());
+    }
+    let manager = app.autolaunch();
+    let result = if enabled { manager.enable() } else { manager.disable() };
+    result.map_err(|error| format!("没能修改开机启动：{error}"))?;
+    Ok(autostart_state(app))
+}
 
 struct Shell {
     connection: Connection,
@@ -58,9 +88,13 @@ fn show_console(app: &AppHandle) {
 fn main() {
     engine::tie_children_to_this_process().expect("couldn't create the job object that keeps child processes from outliving the app");
 
+    // Started with Windows, the app waits in the tray instead of opening its window.
+    let at_login = std::env::args().any(|arg| arg == AT_LOGIN_ARG);
+
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| show_console(app)))
-        .setup(|app| {
+        .plugin(tauri_plugin_autostart::init(tauri_plugin_autostart::MacosLauncher::LaunchAgent, Some(vec![AT_LOGIN_ARG])))
+        .setup(move |app| {
             let connection = Connection::new()?;
             let show_item = MenuItem::with_id(app, "show", "显示控制台", true, None::<&str>)?;
             let toggle_item = MenuItem::with_id(app, "toggle", "打开总闸", true, None::<&str>)?;
@@ -87,8 +121,11 @@ fn main() {
                 })
                 .build(app)?;
 
-            engine::supervise(connection.clone(), app.handle().clone());
+            engine::supervise(connection.clone(), Launch::new(app.handle(), at_login)?, app.handle().clone());
             app.manage(Shell { connection, running: AtomicBool::new(false), toggle_item });
+            if !at_login {
+                show_console(app.handle());
+            }
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -103,7 +140,7 @@ fn main() {
                 }
             }
         })
-        .invoke_handler(tauri::generate_handler![engine_connection, set_running, hide_window, quit_app])
+        .invoke_handler(tauri::generate_handler![engine_connection, set_running, hide_window, quit_app, autostart_state, set_autostart])
         .run(tauri::generate_context!())
         .expect("couldn't start the app");
 }

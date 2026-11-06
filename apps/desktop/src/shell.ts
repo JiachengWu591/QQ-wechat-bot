@@ -23,6 +23,17 @@ export function quitApp() {
   if (inShell) void invoke("quit_app");
 }
 
+// Whether Windows starts the app at login. Only an installed app can be started that way.
+export type Autostart = { available: boolean; enabled: boolean };
+
+export async function autostartState(): Promise<Autostart> {
+  return inShell ? invoke<Autostart>("autostart_state") : { available: false, enabled: false };
+}
+
+export function setAutostart(enabled: boolean): Promise<Autostart> {
+  return invoke<Autostart>("set_autostart", { enabled });
+}
+
 export function subscribeShell(handlers: { onTrayToggle(): void; onCloseRequested(): void; onEngineFailed(): void }): () => void {
   if (!inShell) return () => {};
   const subscriptions = [
