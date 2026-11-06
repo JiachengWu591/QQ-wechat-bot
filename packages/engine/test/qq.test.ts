@@ -5,7 +5,28 @@ import { afterEach, describe, it, type TestContext } from "node:test";
 import type { ChannelStatus, InboundMessage } from "@shu/protocol";
 import { WebSocketServer, type WebSocket } from "ws";
 import { describeNetworkError, networkErrorCode } from "../src/net.ts";
-import { prepareContent, QqAdapter, QqApiError } from "../src/qq.ts";
+import { attachmentUrl, prepareContent, QqAdapter, QqApiError } from "../src/qq.ts";
+import type { Adapter, AdapterMessage } from "../src/types.ts";
+import { WeChatAdapter } from "../src/wechat.ts";
+
+describe("where the owner talks", () => {
+  it("takes the persona in the owner's QQ chat, but not in WeChat, where work is handed over", () => {
+    assert.equal(new QqAdapter({ appId: "a", appSecret: "s" }).personaInOwnerChat, true);
+    assert.equal((new WeChatAdapter({ sessionStore: { load: () => null, save: () => {}, clear: () => {} } }) as Adapter).personaInOwnerChat, undefined);
+  });
+});
+
+describe("QQ attachment links", () => {
+  it("adds the scheme a link comes without", () => {
+    assert.equal(attachmentUrl("//gchat.qpic.cn/a.png")?.href, "https://gchat.qpic.cn/a.png");
+    assert.equal(attachmentUrl("multimedia.nt.qq.com.cn/download?fileid=1")?.href, "https://multimedia.nt.qq.com.cn/download?fileid=1");
+    assert.equal(attachmentUrl(" https://multimedia.nt.qq.com.cn/x ")?.href, "https://multimedia.nt.qq.com.cn/x");
+  });
+
+  it("only fetches web links", () => {
+    for (const link of ["file:///C:/Users/a.txt", "javascript:alert(1)", "ftp://host/a", "", undefined, "https://"]) assert.equal(attachmentUrl(link), null, String(link));
+  });
+});
 
 const SELF = "bot-openid";
 const GROUP = "group-openid-abcdef";
@@ -35,6 +56,8 @@ class FakeQq {
   // What happens to each coming send, in order. Once these run out, sends work normally.
   sendPlan: Array<"drop" | "arrive-then-drop" | { status: number; body: unknown }> = [];
   sendAttempts = 0;
+  // Files a message links to, by path.
+  media = new Map<string, { status?: number; body: Buffer }>();
   #acceptedReplies = new Set<string>();
   #seq = 0;
 
@@ -47,6 +70,11 @@ class FakeQq {
           res.writeHead(status, { "Content-Type": "application/json" });
           res.end(JSON.stringify(body));
         };
+        const file = this.media.get(req.url ?? "");
+        if (req.url?.startsWith("/media/")) {
+          res.writeHead(file?.status ?? (file ? 200 : 404), { "Content-Type": "application/octet-stream" });
+          return res.end(file?.body ?? Buffer.alloc(0));
+        }
         if (req.url === "/app/getAppAccessToken") {
           this.tokenRequests++;
           const step = this.tokenPlan.get(this.tokenRequests);
@@ -248,6 +276,88 @@ describe("QQ adapter", () => {
     fake.dispatch("GROUP_MESSAGE_CREATE", groupEvent({ content: "", attachments: [{ content_type: "image/png", filename: "a.png" }] }));
     await until(() => messages.length === 1, "message");
     assert.equal(messages[0]!.text, "[图片]");
+  });
+
+  it("keeps describing a group's attachments, which are never fetched", async () => {
+    await connect();
+    fake.dispatch("GROUP_MESSAGE_CREATE", groupEvent({ content: "看", attachments: [{ content_type: "image/png", url: `http://127.0.0.1:${fake.port}/media/a.png` }] }));
+    await until(() => messages.length === 1, "message");
+    assert.equal(messages[0]!.text, "看 [图片]");
+    assert.equal((messages[0] as AdapterMessage).attachments, undefined);
+  });
+
+  describe("files in a private message", () => {
+    const dm = (overrides: Record<string, unknown>) => ({ id: "dm-file-12345678", content: "", author: { id: USER, user_openid: USER }, ...overrides });
+    const link = (path: string) => `http://127.0.0.1:${fake.port}${path}`;
+
+    it("hands over an image to be fetched, without a placeholder in the text", async () => {
+      await connect();
+      fake.media.set("/media/a.png", { body: Buffer.from("png-bytes") });
+      fake.dispatch("C2C_MESSAGE_CREATE", dm({ content: "你看这个像谁", attachments: [{ content_type: "image/png", filename: "a.png", url: link("/media/a.png") }] }));
+      await until(() => messages.length === 1, "message");
+      const message = messages[0] as AdapterMessage;
+      assert.equal(message.text, "你看这个像谁");
+      assert.equal(message.attachments?.length, 1);
+      assert.equal(message.attachments![0]!.name, "a.png");
+      assert.deepEqual(await message.attachments![0]!.download(), Buffer.from("png-bytes"));
+    });
+
+    it("delivers a message that is only an image", async () => {
+      await connect();
+      fake.dispatch("C2C_MESSAGE_CREATE", dm({ attachments: [{ content_type: "image/jpeg", url: link("/media/b.jpg") }] }));
+      await until(() => messages.length === 1, "message");
+      assert.equal(messages[0]!.text, "");
+      assert.equal((messages[0] as AdapterMessage).attachments?.length, 1);
+    });
+
+    it("names a file without a name from what it is", async () => {
+      await connect();
+      fake.dispatch(
+        "C2C_MESSAGE_CREATE",
+        dm({ attachments: [{ content_type: "image/png", url: link("/media/1") }, { content_type: "image/jpeg", url: link("/media/2") }, { content_type: "file", url: link("/media/3") }] }),
+      );
+      await until(() => messages.length === 1, "message");
+      assert.deepEqual(
+        (messages[0] as AdapterMessage).attachments?.map((file) => file.name),
+        ["图片-12345678.png", "图片-12345678-2.jpg", "文件-12345678-3"],
+      );
+    });
+
+    it("counts a .jpg sent as a file as an image when it can't be fetched", async () => {
+      await connect();
+      fake.dispatch("C2C_MESSAGE_CREATE", dm({ content: "看", attachments: [{ content_type: "file", filename: "13391010964527855.jpg" }] }));
+      await until(() => messages.length === 1, "message");
+      assert.equal(messages[0]!.text, "看 [图片]");
+      assert.equal((messages[0] as AdapterMessage).attachments, undefined);
+    });
+
+    it("says why a download failed", async () => {
+      await connect();
+      fake.media.set("/media/gone.png", { status: 403, body: Buffer.from("no") });
+      fake.dispatch("C2C_MESSAGE_CREATE", dm({ attachments: [{ content_type: "image/png", url: link("/media/gone.png") }] }));
+      await until(() => messages.length === 1, "message");
+      await assert.rejects((messages[0] as AdapterMessage).attachments![0]!.download(), /HTTP 403/);
+    });
+
+    it("refuses a file over 30 MB", async () => {
+      await connect();
+      fake.media.set("/media/huge.png", { body: Buffer.alloc(30 * 1024 * 1024 + 1) });
+      fake.dispatch("C2C_MESSAGE_CREATE", dm({ attachments: [{ content_type: "image/png", url: link("/media/huge.png") }] }));
+      await until(() => messages.length === 1, "message");
+      await assert.rejects((messages[0] as AdapterMessage).attachments![0]!.download(), /30 MB/);
+    });
+  });
+
+  it("turns QQ faces into words", async () => {
+    await connect();
+    const said = Buffer.from(JSON.stringify({ text: "[微笑]" })).toString("base64");
+    fake.dispatch("C2C_MESSAGE_CREATE", {
+      id: "faces",
+      content: `<faceType=6,faceId="0",ext="eyJ0ZXh0IjoiIn0=">你看<faceType=1,faceId="14",ext="${said}">`,
+      author: { id: USER, user_openid: USER },
+    });
+    await until(() => messages.length === 1, "message");
+    assert.equal(messages[0]!.text, "[表情]你看[微笑]");
   });
 
   it("maps a private message to a private conversation", async () => {

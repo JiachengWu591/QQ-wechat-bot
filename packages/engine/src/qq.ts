@@ -1,7 +1,7 @@
 // The official QQ bot platform: a gateway WebSocket for events and HTTP for sending.
-import type { ChannelStatus, ConversationKind, InboundMessage } from "@shu/protocol";
+import type { ChannelStatus, ConversationKind } from "@shu/protocol";
 import { describeNetworkError, networkErrorCode } from "./net.ts";
-import type { Adapter, AdapterConversation, AdapterHandlers, OutboundText } from "./types.ts";
+import type { Adapter, AdapterConversation, AdapterHandlers, AdapterMessage, InboundAttachment, OutboundText } from "./types.ts";
 
 export const QQ_CHANNEL_ID = "qq";
 
@@ -14,6 +14,10 @@ const MAX_BACKOFF_MS = 30_000;
 const SEEN_LIMIT = 2000;
 // A resume after a long outage can replay old messages. Too late to answer those.
 const MAX_MESSAGE_AGE_MS = 10 * 60_000;
+const MAX_DOWNLOAD_BYTES = 30 * 1024 * 1024;
+const DOWNLOAD_TIMEOUT_MS = 60_000;
+const IMAGE_FILE = /\.(png|jpe?g|gif|webp)$/i;
+const IMAGE_EXTENSIONS: Record<string, string> = { "image/png": ".png", "image/gif": ".gif", "image/webp": ".webp" };
 
 // How long a message can be replied to, and how many times. Past either, a reply goes
 // out as an ordinary message instead, which has its own platform quota.
@@ -47,7 +51,33 @@ type QqUser = {
   is_you?: boolean;
 };
 
-type QqAttachment = { content_type?: string; filename?: string };
+// As the platform's own SDK reads them. The official docs don't list these fields.
+type QqAttachment = { content_type?: string; filename?: string; url?: string; size?: number };
+
+const isImage = (file: QqAttachment) => Boolean(file.content_type?.startsWith("image") || (file.filename && IMAGE_FILE.test(file.filename)));
+
+// Other clients have seen these links both with and without a scheme. Only web links are fetched.
+export function attachmentUrl(raw: string | undefined): URL | null {
+  const link = raw?.trim();
+  if (!link) return null;
+  const withScheme = link.startsWith("//") ? `https:${link}` : /^[a-z][a-z0-9+.-]*:/i.test(link) ? link : `https://${link}`;
+  try {
+    const url = new URL(withScheme);
+    return url.protocol === "https:" || url.protocol === "http:" ? url : null;
+  } catch {
+    return null;
+  }
+}
+
+// A QQ face arrives as markup, with what it says, if anything, as base64 JSON.
+function faceText(ext: string): string {
+  try {
+    const text = (JSON.parse(Buffer.from(ext, "base64").toString("utf8")) as { text?: unknown }).text;
+    return typeof text === "string" && text.trim() ? text.trim() : "[表情]";
+  } catch {
+    return "[表情]";
+  }
+}
 
 type QqMessage = {
   id: string;
@@ -90,6 +120,8 @@ export class QqAdapter implements Adapter {
   readonly id = QQ_CHANNEL_ID;
   readonly name = "QQ";
   readonly promptHint = "不要在回复里写网址，QQ 会拦截带网址的消息。要说明来源，就说网站的名字。";
+  // The owner chats with the bot here; work goes through WeChat.
+  readonly personaInOwnerChat = true;
 
   #appId: string;
   #appSecret: string;
@@ -309,6 +341,11 @@ export class QqAdapter implements Adapter {
 
     this.#remember(message.id, "dm");
     const senderName = author.username || "QQ 用户";
+    // Handed over to be fetched, which the engine only does for the owner. One without a usable
+    // link is still mentioned in the text, so the model knows something was sent.
+    const files = message.attachments ?? [];
+    const fetchable = files.filter((file) => attachmentUrl(file.url));
+    const attachments = fetchable.map((file, index) => this.#attachment(file, message.id, index));
     this.#deliver({
       id: message.id,
       channelId: this.id,
@@ -317,10 +354,26 @@ export class QqAdapter implements Adapter {
       conversationTitle: `和 ${senderName} 的私聊`,
       senderId,
       senderName,
-      text: this.#cleanText(message),
+      text: this.#cleanText(message, files.filter((file) => !fetchable.includes(file))),
       mentionsBot: true,
       at: Date.now(),
+      ...(attachments.length ? { attachments } : {}),
     });
+  }
+
+  #attachment(file: QqAttachment, messageId: string, index: number): InboundAttachment {
+    const url = attachmentUrl(file.url) as URL;
+    const fallback = `${isImage(file) ? "图片" : "文件"}-${messageId.slice(-8)}${index ? `-${index + 1}` : ""}${isImage(file) ? (IMAGE_EXTENSIONS[file.content_type ?? ""] ?? ".jpg") : ""}`;
+    return { name: file.filename?.trim() || fallback, download: () => this.#download(url) };
+  }
+
+  async #download(url: URL): Promise<Buffer> {
+    const response = await fetch(url, { signal: AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS) });
+    if (!response.ok) throw new Error(`QQ 文件下载失败（HTTP ${response.status}）`);
+    if (Number(response.headers.get("content-length") ?? 0) > MAX_DOWNLOAD_BYTES) throw new Error("文件太大，超过 30 MB。");
+    const data = Buffer.from(await response.arrayBuffer());
+    if (data.length > MAX_DOWNLOAD_BYTES) throw new Error("文件太大，超过 30 MB。");
+    return data;
   }
 
   #isStale(message: QqMessage): boolean {
@@ -334,10 +387,12 @@ export class QqAdapter implements Adapter {
     return Boolean(this.#self.id && id === this.#self.id);
   }
 
-  // Raw IDs in the text are noise to the model, so mentions become names.
-  #cleanText(message: QqMessage): string {
+  // Raw IDs and markup in the text are noise to the model, so mentions become names and faces words.
+  // Attachments that aren't handed over are described instead.
+  #cleanText(message: QqMessage, described: QqAttachment[] = message.attachments ?? []): string {
     const mentions = message.mentions ?? [];
     const text = (message.content ?? "")
+      .replace(/<faceType=\d+,faceId="[^"]*",ext="([^"]*)">/g, (_, ext: string) => faceText(ext))
       .replace(/<@!?([^>\s]+)>/g, (_, id: string) => {
         if (id === "all") return "@全体成员";
         const user = mentions.find((entry) => entry.member_openid === id || entry.id === id);
@@ -345,12 +400,12 @@ export class QqAdapter implements Adapter {
         return `@${user?.username || "某人"}`;
       })
       .trim();
-    const attachments = (message.attachments ?? []).map((file) => (file.content_type?.startsWith("image/") ? "[图片]" : `[文件 ${file.filename ?? ""}]`.replace(" ]", "]")));
+    const attachments = described.map((file) => (isImage(file) ? "[图片]" : `[文件 ${file.filename ?? ""}]`.replace(" ]", "]")));
     return [text, ...attachments].filter(Boolean).join(" ");
   }
 
-  #deliver(message: InboundMessage) {
-    if (!message.text) return;
+  #deliver(message: AdapterMessage) {
+    if (!message.text && !message.attachments?.length) return;
     this.#handlers?.onMessage(message);
   }
 
