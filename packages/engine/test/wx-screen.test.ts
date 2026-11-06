@@ -51,9 +51,71 @@ describe("the real helper", windowsOnly, () => {
     assert.doesNotMatch(readingCode(), /SendInput|keybd_event|SendMessage|mouse_event|SetForegroundWindow|SetCursorPos|ShowWindow|WM_KEY|WM_CHAR|WM_PASTE|Clipboard/);
   });
 
-  it("only posts the messages for moving the mouse over a row, clicking it and scrolling", () => {
-    const posted = [...readingCode().matchAll(/\[Win\]::PostMessage\(\$window\.Handle, (\$WM_[A-Z]+),/g)].map((match) => match[1]);
-    assert.deepEqual([...new Set(posted)].sort(), ["$WM_LBUTTONDOWN", "$WM_LBUTTONUP", "$WM_MOUSEMOVE", "$WM_MOUSEWHEEL"]);
+  it("only posts the messages for moving the mouse over a row, clicking it and scrolling, and closes only the record window", () => {
+    const posted = [...readingCode().matchAll(/\[Win\]::PostMessage\(([^,]+), (\$WM_[A-Z]+),/g)].map((match) => `${match[1]} ${match[2]}`);
+    assert.deepEqual([...new Set(posted)].sort(), [
+      "$record.Handle $WM_CLOSE",
+      "$record.Handle $WM_MOUSEWHEEL",
+      "$window.Handle $WM_LBUTTONDOWN",
+      "$window.Handle $WM_LBUTTONUP",
+      "$window.Handle $WM_MOUSEMOVE",
+      "$window.Handle $WM_MOUSEWHEEL",
+    ]);
+  });
+
+  it("moves a window only behind the others, without activating it", () => {
+    const moves = [...readingCode().matchAll(/SetWindowPos\(([^;]*)\)/g)].map((match) => match[1]);
+    assert.deepEqual(moves, ["IntPtr h, IntPtr after, int x, int y, int cx, int cy, uint flags", "h, (IntPtr)1, 0, 0, 0, 0, 0x13"]);
+  });
+
+  it("closes the record window only once it has read as one, and leaves anything else open", () => {
+    const source = script("wx-helper.ps1");
+    const capture = source.slice(source.indexOf("function Invoke-CaptureRecord"), source.indexOf("# A generated record"));
+    const titled = capture.indexOf("if (-not $title) { $first.Dispose(); return @{ state = 'not-record' } }");
+    assert.ok(titled > 0);
+    assert.ok(capture.indexOf("$WM_CLOSE") > titled, "the close is in the finally that follows the title check");
+    assert.ok(capture.indexOf("try {", titled) < capture.indexOf("$WM_CLOSE"));
+  });
+
+  it("joins a generated record that scrolls by uneven steps back into the whole of it, once", async () => {
+    const result = await screen.selfTestRecord();
+    const { shifts, id, slices, expectedPages, expectedRules, ...checks } = result;
+    assert.deepEqual(
+      checks,
+      {
+        state: "ok",
+        // Read to its end, every row exactly once, in images within the size limit cut between lines.
+        complete: true,
+        uncertain: false,
+        pages: expectedPages,
+        rowsMatch: true,
+        slicesFit: true,
+        cutsPlain: true,
+        // Between two messages, not between a name and what was said.
+        cutsBetween: true,
+        // One scroll that moved nothing isn't taken for the end.
+        stalledComplete: true,
+        stalledRowsMatch: true,
+        // Stopping between pixels, with pictures moving, still gives every message once.
+        fractionalComplete: true,
+        fractionalUncertain: false,
+        fractionalRules: expectedRules,
+        // A jump too far to line up says so, rather than joining at a wrong place.
+        skippedIsUncertain: true,
+        skippedComplete: true,
+        // It stops at the page limit and says it didn't reach the end.
+        shortPages: 3,
+        shortComplete: false,
+      },
+      `measured distances: ${String(shifts)}`,
+    );
+    assert.ok((slices as number) > 1);
+    assert.ok((expectedRules as number) > 30);
+  });
+
+  it("finds File Transfer Assistant's row from reads a character or two off, closest first", async () => {
+    const result = await screen.selfTestLocate();
+    assert.deepEqual(result.rows, [340, 470]);
   });
 });
 

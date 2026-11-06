@@ -13,6 +13,10 @@ export type ToolInputSchema = {
 export type ToolContext = {
   // Sends a file back to the conversation this turn belongs to, through the send gate.
   sendFile?(absolutePath: string, fileName: string): Promise<void>;
+  // Ends with the turn.
+  signal?: AbortSignal;
+  // For a tool that calls the model itself, which is paid for from this turn's budget.
+  onCost?(costUsd: number): void;
 };
 
 export type LocalTool = {

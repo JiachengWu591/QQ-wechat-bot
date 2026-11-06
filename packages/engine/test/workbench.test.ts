@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import { afterEach, describe, it } from "node:test";
 import type { WorkbenchStatus } from "@shu/protocol";
-import { confusableGroup, editDistance, identifyGroup, normalizeGroupName, titleMatches, Workbench, type ChatReading, type WorkbenchMention } from "../src/workbench.ts";
-import type { ChatCapture, OpenedRow, ScreenScan, SendOutcome, WeChatScreen } from "../src/wx-screen.ts";
+import { confusableGroup, editDistance, FILE_TRANSFER, identifyGroup, normalizeGroupName, titleMatches, Workbench, type ChatReading, type WorkbenchMention } from "../src/workbench.ts";
+import type { ChatCapture, LocatedChat, OpenedRow, RecordCapture, ScreenScan, SendOutcome, WeChatScreen } from "../src/wx-screen.ts";
 
 // Scripted answers, one per scan. Once they run out it keeps repeating the last one.
 class FakeScreen implements WeChatScreen {
@@ -16,6 +16,7 @@ class FakeScreen implements WeChatScreen {
 
   async scan(): Promise<ScreenScan> {
     this.scans++;
+    if (this.recording) this.overlapped++;
     const next = this.plan.length > 1 ? this.plan.shift() : this.plan[0];
     if (next === undefined) return nothing;
     if (next instanceof Error) throw next;
@@ -42,9 +43,38 @@ class FakeScreen implements WeChatScreen {
     return this.sendAnswer;
   }
 
+  // One answer per look at the session list. Once they run out it keeps repeating the last one.
+  locatePlan: LocatedChat[] = [located({ open: true })];
+  located: string[] = [];
+
+  async locateChat(name: string): Promise<LocatedChat> {
+    this.located.push(name);
+    return (this.locatePlan.length > 1 ? this.locatePlan.shift() : this.locatePlan[0]) as LocatedChat;
+  }
+
+  recorded: string[] = [];
+  recordAnswer: RecordCapture | Promise<RecordCapture> = { state: "ok", title: "群聊的聊天记录", slices: [Buffer.from("top"), Buffer.from("end")], pages: 5, complete: true, uncertain: false };
+  // Set while a record is being read, to show what else happens meanwhile.
+  recording = false;
+  overlapped = 0;
+
+  async captureRecord(chat: string): Promise<RecordCapture> {
+    this.recorded.push(chat);
+    this.recording = true;
+    try {
+      return await this.recordAnswer;
+    } finally {
+      this.recording = false;
+    }
+  }
+
   async stop() {
     this.stops++;
   }
+}
+
+function located({ open = false, rows = [300], foreground = false, idleMs = 60_000 }: { open?: boolean; rows?: number[]; foreground?: boolean; idleMs?: number } = {}): LocatedChat {
+  return { state: "ok", titles: open ? ["文牛传输助手", FILE_TRANSFER] : ["项目周会群(3)"], rows, foreground, idleMs };
 }
 
 function page(...titles: string[]) {
@@ -98,14 +128,17 @@ describe("watching for mentions", () => {
       onDropped: (group) => dropped.push(group),
       onExisting: (count) => existing.push(count),
       onStatus: (status) => statuses.push(status),
+      askedWaitMs,
     });
     workbench.start();
   }
+  let askedWaitMs = 1;
 
   afterEach(async () => {
     await workbench.stop();
     allowed = [];
     readAllowed = true;
+    askedWaitMs = 1;
   });
 
   it("reports a new mention once, however many scans still show it", async () => {
@@ -613,6 +646,154 @@ describe("watching for mentions", () => {
       const before = screen.scans;
       await until(() => screen.scans > before + 5, "scans");
       assert.deepEqual(screen.opened, []);
+    });
+  });
+
+  describe("reading a chat record the owner forwarded", () => {
+    it("only while reading is on", async () => {
+      start(nothing);
+      await workbench.stop();
+      await assert.rejects(workbench.readRecord(), /没有打开/);
+      assert.deepEqual(screen.located, []);
+    });
+
+    it("reads it where it is when File Transfer Assistant is already open, clicking nothing in the list", async () => {
+      start(nothing);
+      const record = await workbench.readRecord();
+      assert.deepEqual(record, { title: "群聊的聊天记录", images: [Buffer.from("top"), Buffer.from("end")], pages: 5, complete: true, uncertain: false });
+      assert.deepEqual(screen.located, [FILE_TRANSFER]);
+      assert.deepEqual(screen.opened, []);
+      assert.deepEqual(screen.recorded, [FILE_TRANSFER]);
+    });
+
+    it("opens File Transfer Assistant from the list first, and reads only once its title says so", async () => {
+      start(nothing);
+      screen.locatePlan = [located({ rows: [420, 300] })];
+      screen.openAnswer = { state: "ok", titles: ["文件传输助于", FILE_TRANSFER] };
+      await workbench.readRecord();
+      assert.deepEqual(screen.opened, [420], "the closest read, which comes first");
+      assert.deepEqual(screen.recorded, [FILE_TRANSFER]);
+    });
+
+    it("stops when what opened has another title", async () => {
+      start(nothing);
+      screen.locatePlan = [located()];
+      screen.openAnswer = { state: "ok", titles: ["文件传输助手群"] };
+      await assert.rejects(workbench.readRecord(), /标题不是“文件传输助手”/);
+      assert.deepEqual(screen.recorded, []);
+    });
+
+    it("says so when the list doesn't show it", async () => {
+      start(nothing);
+      screen.locatePlan = [located({ rows: [] })];
+      await assert.rejects(workbench.readRecord(), /左栏里没看到“文件传输助手”/);
+      assert.deepEqual(screen.opened, []);
+    });
+
+    it("waits for the owner to stop using WeChat before opening it", async () => {
+      start(nothing);
+      screen.locatePlan = [located({ foreground: true, idleMs: 800 }), located({ foreground: true, idleMs: 900 }), located({ foreground: true, idleMs: 6_000 })];
+      screen.openAnswer = { state: "ok", titles: [FILE_TRANSFER] };
+      await workbench.readRecord();
+      assert.equal(screen.located.length, 3);
+      assert.deepEqual(screen.opened, [300]);
+    });
+
+    it("gives up, opening nothing, while the owner keeps using WeChat", { timeout: 5_000 }, async () => {
+      start(nothing);
+      screen.locatePlan = [located({ foreground: true, idleMs: 800 })];
+      await assert.rejects(workbench.readRecord(), /一直在用微信/);
+      assert.deepEqual(screen.opened, []);
+      assert.deepEqual(screen.recorded, []);
+    });
+
+    it("isn't held up by the owner using WeChat when nothing needs opening", async () => {
+      start(nothing);
+      screen.locatePlan = [{ ...located({ open: true }), foreground: true, idleMs: 100 } as LocatedChat];
+      await workbench.readRecord();
+      assert.equal(screen.located.length, 1);
+      assert.deepEqual(screen.recorded, [FILE_TRANSFER]);
+    });
+
+    for (const [state, message] of [
+      ["no-record", /合并转发到文件传输助手/],
+      ["not-opened", /已经开着一个聊天记录窗口/],
+      ["not-record", /没有关掉它/],
+      ["wrong-chat", /不是“文件传输助手”/],
+      ["minimized", /最小化/],
+    ] as const) {
+      it(`explains a ${state} capture`, async () => {
+        start(nothing);
+        screen.recordAnswer = { state } as RecordCapture;
+        await assert.rejects(workbench.readRecord(), message);
+      });
+    }
+
+    it("doesn't scan while a record is being read, and scans again afterwards", async () => {
+      start(nothing);
+      await until(() => screen.scans > 0, "first scan");
+      let finish!: (capture: RecordCapture) => void;
+      screen.recordAnswer = new Promise<RecordCapture>((resolve) => (finish = resolve));
+      const reading = workbench.readRecord();
+      await until(() => screen.recording, "reading the record");
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      finish({ state: "ok", title: "群聊的聊天记录", slices: [Buffer.from("x")], pages: 1, complete: true, uncertain: false });
+      await reading;
+      const after = screen.scans;
+      await until(() => screen.scans > after + 3, "scans afterwards");
+      assert.equal(screen.overlapped, 0);
+    });
+
+    it("holds back a send until the record has been read", async () => {
+      start(nothing);
+      let finish!: (capture: RecordCapture) => void;
+      screen.recordAnswer = new Promise<RecordCapture>((resolve) => (finish = resolve));
+      const reading = workbench.readRecord();
+      await until(() => screen.recording, "reading the record");
+      const sending = workbench.sendDraft("财务报销群", "收到");
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      assert.deepEqual(screen.sends, []);
+      finish({ state: "ok", title: "群聊的聊天记录", slices: [Buffer.from("x")], pages: 1, complete: true, uncertain: false });
+      await reading;
+      await sending;
+      assert.equal(screen.sends.length, 1);
+    });
+
+    it("won't start while a reply is being sent", async () => {
+      start(nothing);
+      let finish!: (outcome: SendOutcome) => void;
+      screen.sendAnswer = new Promise<SendOutcome>((resolve) => (finish = resolve));
+      const sending = workbench.sendDraft("财务报销群", "收到");
+      await until(() => screen.sends.length === 1, "sending");
+      await assert.rejects(workbench.readRecord(), /正在往群里发消息/);
+      assert.deepEqual(screen.located, []);
+      finish({ state: "sent" });
+      await sending;
+    });
+
+    it("gives nothing back, and asks the helper nothing more, once stopped", async () => {
+      start(nothing);
+      let finish!: (capture: RecordCapture) => void;
+      screen.recordAnswer = new Promise<RecordCapture>((resolve) => (finish = resolve));
+      const reading = workbench.readRecord();
+      await until(() => screen.recording, "reading the record");
+      await workbench.stop();
+      finish({ state: "ok", title: "群聊的聊天记录", slices: [Buffer.from("x")], pages: 1, complete: true, uncertain: false });
+      await assert.rejects(reading, /已停止/);
+      const scans = screen.scans;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      assert.equal(screen.scans, scans);
+    });
+
+    it("asks nothing of the helper after a stop that came while waiting for the owner", async () => {
+      askedWaitMs = 100;
+      start(nothing);
+      screen.locatePlan = [located({ foreground: true, idleMs: 800 })];
+      const reading = workbench.readRecord();
+      await until(() => screen.located.length === 1, "first look");
+      await workbench.stop();
+      await assert.rejects(reading, /已停止/);
+      assert.equal(screen.located.length, 1);
     });
   });
 });

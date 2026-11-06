@@ -6,6 +6,12 @@ import { fileURLToPath } from "node:url";
 const DEFAULT_SCRIPT = fileURLToPath(new URL("./wx-helper.ps1", import.meta.url));
 const DEFAULT_SENDER = fileURLToPath(new URL("./wx-send.ps1", import.meta.url));
 const REQUEST_TIMEOUT_MS = 30_000;
+// About two seconds a page, at the most pages a record is read to.
+const RECORD_TIMEOUT_MS = 180_000;
+const RECORD_MAX_PAGES = 40;
+// Eight spaced-out wheel messages move about 480 px of a record window's 790, leaving room to line
+// pages up by.
+const RECORD_POSTS_PER_PAGE = 8;
 // It waits up to 30 seconds for the owner to stop typing, then has to type the whole reply.
 const SEND_TIMEOUT_MS = 120_000;
 const MAX_STDERR_CHARS = 300;
@@ -23,6 +29,16 @@ export type ChatPage = { image: Buffer; titles: string[] };
 
 export type ChatCapture = Unavailable | { state: "ok"; pages: ChatPage[]; reachedTop: boolean; interrupted: boolean };
 
+// Rows that may be this chat in the session list, likeliest first, and the open chat's title as read.
+export type LocatedChat = Unavailable | { state: "ok"; titles: string[]; rows: number[]; foreground: boolean; idleMs: number };
+
+// A forwarded chat record, read from top to bottom and joined into slices. Complete means it was
+// read to its end. Uncertain means two pages couldn't be lined up, so a few lines may repeat there.
+export type RecordCapture =
+  | Unavailable
+  | { state: "wrong-chat" | "no-record" | "not-opened" | "not-record" }
+  | { state: "ok"; title: string; slices: Buffer[]; pages: number; complete: boolean; uncertain: boolean };
+
 // Refused means Enter was never pressed. Uncertain means it was, and whether the message went out
 // couldn't be confirmed, so it must not simply be tried again.
 export type SendOutcome = { state: "sent" } | { state: "refused" | "uncertain"; reason: string };
@@ -33,6 +49,9 @@ export interface WeChatScreen {
   openRow(y: number): Promise<OpenedRow>;
   // The open chat, oldest page first.
   captureChat(options: { pages: number; postsPerPage: number }): Promise<ChatCapture>;
+  locateChat(name: string): Promise<LocatedChat>;
+  // Opens the newest chat record in the open chat, which must be this one, reads it and closes it.
+  captureRecord(chat: string): Promise<RecordCapture>;
   // Types into that group's chat and sends. Takes the foreground for as long as that takes. A mention
   // picks this exact name from WeChat's member list first, or stops.
   sendText(group: string, text: string, mention?: string): Promise<SendOutcome>;
@@ -149,8 +168,27 @@ export class WxHelperScreen implements WeChatScreen {
     return { state: "ok", pages, reachedTop: raw.reachedTop, interrupted: raw.interrupted };
   }
 
+  locateChat(name: string): Promise<LocatedChat> {
+    return this.#request("locateChat", { name });
+  }
+
+  async captureRecord(chat: string): Promise<RecordCapture> {
+    type Raw = Exclude<RecordCapture, { state: "ok" }> | { state: "ok"; title: string; slices: string[]; pages: number; complete: boolean; uncertain: boolean };
+    const raw = await this.#request<Raw>("captureRecord", { chat, maxPages: RECORD_MAX_PAGES, postsPerPage: RECORD_POSTS_PER_PAGE }, RECORD_TIMEOUT_MS);
+    if (raw.state !== "ok") return raw;
+    return { ...raw, slices: raw.slices.map((slice) => Buffer.from(slice, "base64")) };
+  }
+
   selfTest(): Promise<ScreenScan> {
     return this.#request("selftest");
+  }
+
+  selfTestRecord(): Promise<Record<string, unknown>> {
+    return this.#request("selftestRecord");
+  }
+
+  selfTestLocate(): Promise<{ state: string; rows: number[] }> {
+    return this.#request("selftestLocate");
   }
 
   selfTestRows(): Promise<ScreenScan> {
@@ -166,15 +204,15 @@ export class WxHelperScreen implements WeChatScreen {
     this.#end(new Error("已停止读取微信窗口。"));
   }
 
-  #request<T>(command: string, args: Record<string, number> = {}): Promise<T> {
+  #request<T>(command: string, args: Record<string, number | string> = {}, timeoutMs = this.#timeoutMs): Promise<T> {
     const child = this.#child ?? this.#launch();
     const id = ++this.#nextId;
     return new Promise<T>((resolve, reject) => {
       // A stuck helper would never answer anything again, so this ends it rather than just this
       // request. The next one starts a fresh helper.
-      const timer = setTimeout(() => this.#end(new Error("读取微信窗口超时。")), this.#timeoutMs);
+      const timer = setTimeout(() => this.#end(new Error("读取微信窗口超时。")), timeoutMs);
       this.#waiting.set(id, { resolve, reject, timer });
-      child.stdin.write(`${JSON.stringify({ ...args, id, command })}\n`);
+      child.stdin.write(`${asciiJson({ ...args, id, command })}\n`);
     });
   }
 
