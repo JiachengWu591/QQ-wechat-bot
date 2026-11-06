@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { workMentionProblem, workMessageProblem } from "@shu/protocol";
-import { CHAT_READ_SYSTEM, chatReadPrompt, cleanDraft, mentionReminder, parseChatRead, readReminder, sendProblem, suggestedMention } from "../src/wx-read.ts";
+import { CHAT_READ_SYSTEM, chatReadPrompt, cleanDraft, isPlaceholder, mentionReminder, newReplyCode, parseApproval, parseChatRead, readReminder, rewriteLine, sendProblem, suggestedMention } from "../src/wx-read.ts";
 
 const answer = { messages: [{ sender: "小明", time: "09:30", text: "@主人 报告发一下", fromOwner: false }], mention: { sender: "小明", text: "@主人 报告发一下" }, summary: "小明在催报告。" };
 
@@ -25,6 +25,53 @@ describe("understanding what the model read", () => {
     assert.equal(parseChatRead("{broken"), null);
     assert.equal(parseChatRead(JSON.stringify({ messages: "none" })), null);
     assert.equal(parseChatRead(JSON.stringify({ messages: [], summary: "x" })), null);
+  });
+});
+
+describe("the owner answering a reminder from their phone", () => {
+  it("reads a send, with the draft as it is or as rewritten", () => {
+    assert.deepEqual(parseApproval("发 KQ27"), { action: "send", code: "KQ27" });
+    assert.deepEqual(parseApproval("发KQ27"), { action: "send", code: "KQ27" });
+    assert.deepEqual(parseApproval("  发 kq27  "), { action: "send", code: "KQ27" });
+    assert.deepEqual(parseApproval("发 KQ27 报告周五发你。"), { action: "send", code: "KQ27", text: "报告周五发你。" });
+  });
+
+  it("reads who to mention, or that nobody should be, right after the code", () => {
+    assert.deepEqual(parseApproval("发 KQ27 @老王 好的"), { action: "send", code: "KQ27", text: "好的", mention: "老王" });
+    assert.deepEqual(parseApproval("发 KQ27 @老王"), { action: "send", code: "KQ27", mention: "老王" });
+    assert.deepEqual(parseApproval("发 KQ27 不@ 好的"), { action: "send", code: "KQ27", text: "好的", mention: null });
+    assert.deepEqual(parseApproval("发 KQ27 不@"), { action: "send", code: "KQ27", mention: null });
+    assert.deepEqual(parseApproval("发 KQ27 好的 @老王"), { action: "send", code: "KQ27", text: "好的 @老王" }, "an @ further along is part of the text, which then can't be sent");
+  });
+
+  it("takes what a phone keyboard gives: full-width letters, digits, spaces and @", () => {
+    assert.deepEqual(parseApproval("发　ＫＱ２７　＠老王　好的"), { action: "send", code: "KQ27", text: "好的", mention: "老王" });
+  });
+
+  it("keeps the owner's text exactly as typed, full-width punctuation and all", () => {
+    assert.deepEqual(parseApproval("发 KQ27 好的，周五（下午）发：ＯＫ"), { action: "send", code: "KQ27", text: "好的，周五（下午）发：ＯＫ" });
+  });
+
+  it("reads a send after one that may have gone out, and dropping a draft", () => {
+    assert.deepEqual(parseApproval("重发 KQ27"), { action: "resend", code: "KQ27" });
+    assert.deepEqual(parseApproval("不发 KQ27"), { action: "drop", code: "KQ27" });
+    assert.deepEqual(parseApproval("不发 KQ27 算了"), { action: "drop", code: "KQ27" });
+  });
+
+  it("leaves ordinary messages alone", () => {
+    for (const text of ["发 PDF 给我", "发个文件给我", "发KQ27给我", "发 MP3", "请发 KQ27", "发 KQ277", "发 K27", "把 KQ27 发了"]) {
+      assert.equal(parseApproval(text), null, text);
+    }
+  });
+
+  it("makes codes of two letters and two digits that can't be mistyped for each other, and not one in use", () => {
+    let next = 0;
+    const counting = (count: number) => next++ % count;
+    const code = newReplyCode(counting, []);
+    assert.match(code, /^[A-HJKMNP-Z]{2}[2-9]{2}$/);
+    assert.equal(code, "AB45");
+    next = 0;
+    assert.notEqual(newReplyCode(counting, ["AB45"]), "AB45");
   });
 });
 
@@ -203,6 +250,48 @@ describe("what the owner is told", () => {
       readReminder("甲", { ...answer, mention: null, summary: "", draft: "好的，【时间】发你。" }),
       "“甲”里有人 @ 你。\n草稿：好的，【时间】发你。\n要发送的话，到控制台的“待确认”里确认。",
     );
+  });
+
+  it("says how to send it from the phone, with or without the @", () => {
+    assert.equal(
+      readReminder("甲", { ...answer, mention: null, summary: "", draft: "周五发。" }, { code: "KQ27" }),
+      "“甲”里有人 @ 你。\n草稿：周五发。\n回复“发 KQ27”就照这句发出去。要改的话，在“发 KQ27”后面空一格，接着写上要发到群里的那句话。也可以到控制台的“待确认”里改了再发。",
+    );
+    assert.equal(
+      readReminder("甲", { ...answer, mention: null, summary: "", draft: "周五发。" }, { code: "KQ27", mention: "小明" }),
+      "“甲”里有人 @ 你。\n草稿：周五发。\n回复“发 KQ27”就照这句发出去。要改的话，在“发 KQ27”后面空一格，接着写上要发到群里的那句话。会同时 @小明，不想 @ 就在代码后面加“不@”。也可以到控制台的“待确认”里改了再发。",
+    );
+  });
+
+  it("says what has to change first when the draft can't go out as it is, and points to the line to copy", () => {
+    assert.equal(
+      readReminder("甲", { ...answer, mention: null, summary: "", draft: "【时间】发你。" }, { code: "KQ27" }),
+      "“甲”里有人 @ 你。\n草稿：【时间】发你。\n草稿里还有【】，填好才能发送。下一条消息是可以直接改的一行：长按复制，把要补的地方改好再发给我。也可以到控制台的“待确认”里改了再发。",
+    );
+    assert.equal(rewriteLine({ ...answer, draft: "【时间】发你。" }, "KQ27"), "发 KQ27 【时间】发你。");
+  });
+
+  it("gives no line to copy for a draft that can go out as it is", () => {
+    assert.equal(rewriteLine({ ...answer, draft: "周五发。" }, "KQ27"), null);
+    assert.equal(rewriteLine({ ...answer, draft: null }, "KQ27"), null);
+  });
+
+  it("never offers wording that would be sent as the message if copied", () => {
+    const reminders = [
+      readReminder("甲", { ...answer, draft: "周五发。" }, { code: "KQ27", mention: "小明" }),
+      readReminder("甲", { ...answer, draft: "【时间】发你。" }, { code: "KQ27", mention: "小明" }),
+    ];
+    for (const reminder of reminders) {
+      // Apart from the group's name and the console's page, anything quoted is a command, and the
+      // only one is the code on its own.
+      const quoted = [...reminder.matchAll(/“([^”]+)”/g)].map(([, text]) => text);
+      assert.deepEqual(quoted.filter((text) => !["甲", "不@", "待确认", "发 KQ27"].includes(text!)), [], reminder);
+    }
+  });
+
+  it("recognises the reminder's own words, so they aren't sent as the message", () => {
+    for (const text of ["改好的整句", "改过的整句", "整句", "“改好的整句”", "改好的整句。", " 要发到群里的那句话 "]) assert.equal(isPlaceholder(text), true, text);
+    for (const text of ["好的，整句都改了。", "报告周五发你。", "那句话我晚点回"]) assert.equal(isPlaceholder(text), false, text);
   });
 
   it("doesn't point to a draft when there isn't one", () => {

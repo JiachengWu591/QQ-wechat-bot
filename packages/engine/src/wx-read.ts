@@ -1,7 +1,7 @@
 // Turns screenshots of a work group into something the owner can act on. Everything on those
 // screens was written by other people, so the model reading them gets no tools, and what it says
 // only ever goes to the owner.
-import { workMentionProblem } from "@shu/protocol";
+import { workMentionProblem, workMessageProblem } from "@shu/protocol";
 import { z } from "zod";
 
 const MAX_GROUP_CHARS = 40;
@@ -90,6 +90,50 @@ export function sendProblem(outcome: { state: string; reason?: string }): string
   return `不确定有没有发出去。${UNCERTAIN[reason] ?? ""}请看一下微信，确认没发出去再重试。`;
 }
 
+// What the owner replies from their phone to deal with a work group draft. Two letters and two digits,
+// so an ordinary message such as “发 PDF 给我” never reads as one, without I, L, O, 0 or 1, which are
+// easily mistyped for each other.
+const CODE_LETTERS = "ABCDEFGHJKMNPQRSTUVWXYZ";
+const CODE_DIGITS = "23456789";
+// Full-width forms are spelled out rather than normalised, so what the owner wrote goes out as written.
+const APPROVAL = /^(重发|不发|发)\s*([A-Za-zＡ-Ｚａ-ｚ]{2}[0-9０-９]{2})(?:\s+([\s\S]*))?$/;
+
+export function newReplyCode(pick: (count: number) => number, taken: Iterable<string>): string {
+  const used = new Set(taken);
+  for (;;) {
+    const code = [CODE_LETTERS, CODE_LETTERS, CODE_DIGITS, CODE_DIGITS].map((set) => set[pick(set.length)]).join("");
+    if (!used.has(code)) return code;
+  }
+}
+
+// “发 KQ27” sends the draft as it is, “发 KQ27 整句” sends that instead, and either can say who to
+// mention right after the code, “@名字”, or that nobody should be, “不@”. “重发 KQ27” is for after a
+// send that may have gone out, once the owner has looked, and “不发 KQ27” drops it. A phone keyboard
+// can give full-width letters, digits, spaces and @, which count the same in the command, while the
+// text and the name are kept exactly as typed.
+export type Approval = { action: "send" | "resend" | "drop"; code: string; text?: string; mention?: string | null };
+
+export function parseApproval(input: string): Approval | null {
+  const match = APPROVAL.exec(input.trim());
+  if (!match) return null;
+  const action = match[1] === "重发" ? "resend" : match[1] === "不发" ? "drop" : "send";
+  const code = (match[2] as string).normalize("NFKC").toUpperCase();
+  if (action === "drop") return { action, code };
+  let rest = (match[3] ?? "").trim();
+  let mention: string | null | undefined;
+  const noOne = /^不\s*[@＠]\s*/.exec(rest);
+  const someone = /^[@＠](\S+)\s*/.exec(rest);
+  if (noOne) {
+    mention = null;
+    rest = rest.slice(noOne[0].length);
+  } else if (someone) {
+    mention = someone[1] as string;
+    rest = rest.slice(someone[0].length);
+  }
+  rest = rest.trim();
+  return { action, code, ...(rest ? { text: rest } : {}), ...(mention === undefined ? {} : { mention }) };
+}
+
 // Who to suggest picking from the member list: whoever mentioned the owner, if that's a name the
 // list could be searched for.
 export function suggestedMention(read: ChatRead): string | undefined {
@@ -104,16 +148,45 @@ export function cleanDraft(read: ChatRead): string | null {
   return cut(read.draft ?? "", MAX_DRAFT_CHARS).replace(/^([@＠]\S+\s*)+/, "") || null;
 }
 
-export function readReminder(group: string, read: ChatRead): string {
+// The words the reminder uses to describe what goes after the code. Sent back as they are, they'd go
+// out to the group as the message, which happened once in real use.
+const PLACEHOLDERS = new Set(["整句", "改好的整句", "改过的整句", "要发的整句", "改好的句子", "那句话", "要发到群里的那句话"]);
+
+export function isPlaceholder(text: string): boolean {
+  return PLACEHOLDERS.has(text.trim().replace(/^[“"「]|[”"」]$/g, "").replace(/[。.]$/, ""));
+}
+
+// A draft that can't go out as it is comes with the whole command on a line of its own, sent as a
+// separate message so a long press copies just that. Sent back unchanged, it's still refused.
+export function rewriteLine(read: ChatRead, code: string): string | null {
+  const draft = cleanDraft(read);
+  return draft && workMessageProblem(draft) ? `发 ${code} ${draft}` : null;
+}
+
+// With a reply code, the owner can send the draft by answering this. Without one, only from the console.
+export function readReminder(group: string, read: ChatRead, approval?: { code: string; mention?: string }): string {
   const draft = cleanDraft(read);
   return mentionReminder(
     group,
     [
       read.mention ? `${read.mention.sender ?? "有人"}：${cut(read.mention.text, MAX_MENTION_CHARS)}` : "",
       cut(read.summary, MAX_SUMMARY_CHARS),
-      draft ? `草稿：${draft}\n要发送的话，到控制台的“待确认”里确认。` : "这次没有写草稿，要回复的话请自己回。",
+      draft ? `草稿：${draft}\n${approval ? approvalHelp(draft, approval) : "要发送的话，到控制台的“待确认”里确认。"}` : "这次没有写草稿，要回复的话请自己回。",
     ]
       .filter(Boolean)
       .join("\n"),
   );
+}
+
+function approvalHelp(draft: string, { code, mention }: { code: string; mention?: string }): string {
+  const problem = workMessageProblem(draft);
+  return [
+    problem
+      ? `${problem}下一条消息是可以直接改的一行：长按复制，把要补的地方改好再发给我。`
+      : `回复“发 ${code}”就照这句发出去。要改的话，在“发 ${code}”后面空一格，接着写上要发到群里的那句话。`,
+    mention ? `会同时 @${mention}，不想 @ 就在代码后面加“不@”。` : "",
+    "也可以到控制台的“待确认”里改了再发。",
+  ]
+    .filter(Boolean)
+    .join("");
 }

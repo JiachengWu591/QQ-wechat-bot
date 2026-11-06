@@ -71,6 +71,7 @@ function PendingCard({ reply, engine, state }: { reply: PendingReply; engine: En
             忽略
           </button>
           <span className="panel-meta">{workGroupNote()}</span>
+          {reply.replyCode ? <span className="panel-meta">在手机上回复“发 {reply.replyCode}”也能发。</span> : null}
         </div>
       ) : (
         <div className="actions">

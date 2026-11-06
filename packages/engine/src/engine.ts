@@ -29,7 +29,22 @@ import { noInput, type LocalTool, type ToolContext } from "./tools.ts";
 import type { Adapter, AdapterConversation, AdapterMessage } from "./types.ts";
 import { confusableGroup, normalizeGroupName, Workbench, type ChatReading, type WorkbenchMention } from "./workbench.ts";
 import type { Workspace } from "./workspace.ts";
-import { CHAT_READ_SYSTEM, chatReadPrompt, cleanDraft, mentionReminder, parseChatRead, readReminder, sendProblem, suggestedMention, type ChatRead } from "./wx-read.ts";
+import {
+  CHAT_READ_SYSTEM,
+  chatReadPrompt,
+  cleanDraft,
+  isPlaceholder,
+  mentionReminder,
+  newReplyCode,
+  parseApproval,
+  parseChatRead,
+  readReminder,
+  rewriteLine,
+  sendProblem,
+  suggestedMention,
+  type Approval,
+  type ChatRead,
+} from "./wx-read.ts";
 import { RECORD_READ_SYSTEM, recordFile, recordReadPrompt, recordToolResult } from "./wx-record.ts";
 import type { WeChatScreen } from "./wx-screen.ts";
 
@@ -355,7 +370,9 @@ export class Engine extends EventEmitter<EngineEvents> {
       }
       const drafted = this.#holdWorkDraft(group, read, result.costUsd);
       this.#log("ok", `读了 ${images.length} 屏${reachedTop ? "（已到顶）" : ""}，${read.messages.length} 条消息，${drafted ? "写了草稿" : "没有写草稿"}`, group, result.costUsd);
-      await this.#remindOwner(readReminder(group, read));
+      await this.#remindOwner(readReminder(group, read, drafted ?? undefined));
+      const line = drafted ? rewriteLine(read, drafted.code) : null;
+      if (line) await this.#remindOwner(line);
     } catch (error) {
       if (signal.aborted) return;
       this.#log("error", `读内容时出错：${error instanceof Error ? error.message : String(error)}`, group);
@@ -364,16 +381,18 @@ export class Engine extends EventEmitter<EngineEvents> {
   }
 
   // The newest draft replaces an older one for the same group, which answered a conversation that
-  // has since moved on.
-  #holdWorkDraft(group: string, read: ChatRead, costUsd: number): boolean {
+  // has since moved on, so the older one's code stops working too. Gives what the owner can reply.
+  #holdWorkDraft(group: string, read: ChatRead, costUsd: number): { code: string; mention?: string } | null {
     const draft = cleanDraft(read);
-    if (!draft) return false;
+    if (!draft) return null;
     for (const reply of this.#store.listPending()) {
       if (reply.channelId === WECHAT_WORK_CHANNEL_ID && reply.conversationId === group) this.#store.removePending(reply.id);
     }
     const mention = suggestedMention(read);
+    const code = newReplyCode(randomInt, this.#store.listPending().flatMap((reply) => (reply.replyCode ? [reply.replyCode] : [])));
     this.#store.addPending({
       ...(mention ? { mentionName: mention } : {}),
+      replyCode: code,
       id: randomUUID(),
       channelId: WECHAT_WORK_CHANNEL_ID,
       conversationId: group,
@@ -388,7 +407,63 @@ export class Engine extends EventEmitter<EngineEvents> {
       createdAt: this.#now(),
     });
     this.#emitState();
-    return true;
+    return { code, ...(mention ? { mention } : {}) };
+  }
+
+  // The owner answering a reminder from their phone. Worked out here, from what the owner typed,
+  // before any model sees the message, and never stored: no model can approve a send, and the
+  // group's name and the draft stay out of every chat history. The send itself is the console's,
+  // with every one of its checks.
+  async #approveFromChat(approval: Approval, conversation: AdapterConversation, message: AdapterMessage) {
+    const reply = this.#store.listPending().find((entry) => entry.channelId === WECHAT_WORK_CHANNEL_ID && entry.replyCode === approval.code);
+    const tell = (text: string) => this.#tellOwner(conversation, message.channelId, text);
+    if (!reply) {
+      this.#log("info", `主人在私聊里回复了代码 ${approval.code}，但没有这条草稿`);
+      return tell(`没有代码是 ${approval.code} 的草稿，可能已经发了、忽略了，或者换成了新的草稿。`);
+    }
+    const group = reply.conversationTitle;
+
+    if (approval.action === "drop") {
+      this.#log("info", "主人在私聊里回复了不发", group);
+      this.reject(reply.id);
+      return tell(`好的，“${group}”的这条草稿不发了。`);
+    }
+    if (reply.sendUncertain && approval.action !== "resend") {
+      this.#log("blocked", "主人在私聊里要发送，但上一次不确定有没有发出去，要先确认", group);
+      return tell(`上一次不确定有没有发到“${group}”。请先看一下微信，确认没发出去再回复“重发 ${approval.code}”。`);
+    }
+    if (approval.text && isPlaceholder(approval.text)) {
+      this.#log("blocked", `主人回复的“${approval.text}”是提醒里的说明文字，没有发送`, group);
+      const needsRewrite = workMessageProblem(reply.draft) !== null;
+      await tell(
+        `没有发送：“${approval.text}”是提醒里的说明，不是要发的内容。${needsRewrite ? "下一条是可以直接改的一行，长按复制，把要补的地方改好再发给我。" : `照草稿发的话，回复“发 ${approval.code}”。`}`,
+      );
+      if (needsRewrite) await tell(`发 ${approval.code} ${reply.draft}`);
+      return;
+    }
+
+    const text = approval.text ?? reply.draft;
+    const mention = approval.mention === null ? undefined : (approval.mention ?? reply.mentionName);
+    this.#log("info", `主人在私聊里批准发送${mention ? `（@ ${mention}）` : ""}`, group);
+    try {
+      await this.approve(reply.id, approval.text, { confirmedUnsent: approval.action === "resend", ...(mention ? { mention } : {}) });
+      await tell(`已发到“${group}”：${mention ? `@${mention} ` : ""}${preview(text)}`);
+    } catch (error) {
+      const why = error instanceof Error ? error.message : String(error);
+      const nowUncertain = this.#store.listPending().some((entry) => entry.id === reply.id && entry.sendUncertain);
+      await tell(`没有发到“${group}”。${why}${nowUncertain ? `确认没发出去的话，回复“重发 ${approval.code}”。` : ""}`);
+    }
+  }
+
+  // A reply in the owner's own conversation that isn't recorded in it, for anything that names a
+  // group or carries what was said there.
+  async #tellOwner(conversation: AdapterConversation, channelId: string, text: string) {
+    if (!this.#canSend(channelId, conversation.id)) return;
+    try {
+      await this.#adapterFor(channelId).send({ channelId, conversationId: conversation.id, conversationKind: conversation.kind, text });
+    } catch (error) {
+      this.#log("error", `消息发送失败：${error instanceof Error ? error.message : String(error)}`, this.#titleOf(channelId, conversation));
+    }
   }
 
   // Not recorded as part of the conversation. A group's name is whatever someone else typed, and
@@ -534,6 +609,10 @@ export class Engine extends EventEmitter<EngineEvents> {
     if (tier === "owner" && conversation.kind === "dm" && CANCEL_WORDS.has(message.text.trim().toLowerCase())) {
       return this.#cancelTurns(key, conversation, message);
     }
+    if (tier === "owner" && conversation.kind === "dm" && !message.attachments?.length) {
+      const approval = parseApproval(message.text);
+      if (approval) return this.#approveFromChat(approval, conversation, message);
+    }
 
     const line: ChatLine = {
       id: message.id,
@@ -632,13 +711,18 @@ export class Engine extends EventEmitter<EngineEvents> {
   // Only ever from the owner approving this draft in the console. Nothing here retries: a message
   // that may have gone out can't be sent again without the owner saying they've looked.
   async #sendWorkDraft(reply: PendingReply, text: string, { confirmedUnsent, mention }: { confirmedUnsent?: boolean; mention?: string }) {
-    if (!this.#workbench || !this.#running || !this.#workbenchEnabled()) throw new Error("总闸或微信工作群开关已关闭，打开后才能发送。");
     const group = reply.conversationId;
-    if (!this.#allowedGroups().includes(group)) throw new Error("这个群已经不在允许名单里了，没有发送。");
+    // Logged as well as thrown: a refusal of an answer from the phone has nowhere else to show.
+    const refuse = (why: string) => {
+      this.#log("blocked", why, group);
+      return new Error(why);
+    };
+    if (!this.#workbench || !this.#running || !this.#workbenchEnabled()) throw refuse("总闸或微信工作群开关已关闭，打开后才能发送。");
+    if (!this.#allowedGroups().includes(group)) throw refuse("这个群已经不在允许名单里了，没有发送。");
     const problem = workMessageProblem(text) ?? (mention ? workMentionProblem(mention) : null);
-    if (problem) throw new Error(problem);
-    if (this.#workbenchSending) throw new Error("正在发送另一条，等它结束再试。");
-    if (reply.sendUncertain && !confirmedUnsent) throw new Error("上一次不确定有没有发出去，请先看一下微信，确认没发出去再发。");
+    if (problem) throw refuse(problem);
+    if (this.#workbenchSending) throw refuse("正在发送另一条，等它结束再试。");
+    if (reply.sendUncertain && !confirmedUnsent) throw refuse("上一次不确定有没有发出去，请先看一下微信，确认没发出去再发。");
 
     this.#workbenchSending = true;
     this.#emitState();

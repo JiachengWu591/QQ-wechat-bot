@@ -140,6 +140,9 @@ export type PendingReply = {
   sendUncertain?: boolean;
   // Who to pick from WeChat's member list when sending. The owner can change it.
   mentionName?: string;
+  // What the owner replies with, from their phone, to send a work group draft without the console.
+  // Only ever shown to the owner.
+  replyCode?: string;
 };
 
 export type SimSender = { id: string; name: string; tier: Tier };
