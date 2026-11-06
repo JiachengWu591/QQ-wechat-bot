@@ -7,6 +7,13 @@
       "runtimeArgs": ["scripts/dev.mjs"],
       "port": 5173,
       "url": "http://127.0.0.1:5173"
+    },
+    {
+      "name": "console-sim",
+      "runtimeExecutable": "node",
+      "runtimeArgs": ["--env-file=scripts/sim-only.env", "scripts/dev.mjs"],
+      "port": 5184,
+      "url": "http://127.0.0.1:5184"
     }
   ]
 }

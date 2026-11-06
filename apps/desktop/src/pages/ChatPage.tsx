@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState, type FormEvent, type KeyboardEvent } from "react";
 import { Send } from "lucide-react";
-import type { ActivityEntry, ChatLine, EngineState } from "@shu/protocol";
+import { MAX_PERSONA_EXAMPLE_CHARS, type ActivityEntry, type ChatLine, type EngineState } from "@shu/protocol";
 import { formatTime, tierLabels } from "../ui.tsx";
 import type { EngineApi } from "../useEngine.ts";
 
@@ -8,14 +8,25 @@ type TimelineItem = { kind: "line"; at: number; line: ChatLine } | { kind: "noti
 
 const SIM_CHANNEL = "sim";
 
+const clip = (text: string) => text.replace(/\s+/g, " ").trim().slice(0, MAX_PERSONA_EXAMPLE_CHARS);
+
 export function ChatPage({ engine, state }: { engine: EngineApi; state: EngineState }) {
   const conversations = state.channels.flatMap((channel) =>
-    channel.conversations.map((conversation) => ({ ...conversation, channelId: channel.id, channelName: channel.name, key: `${channel.id}:${conversation.id}` })),
+    channel.conversations.map((conversation) => ({
+      ...conversation,
+      channelId: channel.id,
+      channelName: channel.name,
+      personaInOwnerChat: Boolean(channel.personaInOwnerChat),
+      key: `${channel.id}:${conversation.id}`,
+    })),
   );
   const [selected, setSelected] = useState(conversations.find((entry) => entry.channelId === SIM_CHANNEL)?.key ?? conversations[0]?.key ?? "");
   const [senderId, setSenderId] = useState(state.simSenders.find((sender) => sender.tier === "member")?.id ?? "");
   const [mention, setMention] = useState(true);
   const [text, setText] = useState("");
+  // A bot reply being rewritten into what it should have said, to keep as a persona example.
+  const [fixing, setFixing] = useState<{ lineId: string; text: string } | null>(null);
+  const [kept, setKept] = useState<ReadonlySet<string>>(new Set());
   const bottom = useRef<HTMLDivElement>(null);
 
   const conversation = conversations.find((entry) => entry.key === selected);
@@ -35,9 +46,35 @@ export function ChatPage({ engine, state }: { engine: EngineApi; state: EngineSt
     return [...lines, ...notices].sort((a, b) => a.at - b.at);
   }, [engine.chat, engine.activity, conversation?.channelId, conversation?.id, conversation?.title]);
 
+  // What each bot reply answered: the message just before it.
+  const answered = useMemo(() => {
+    const map = new Map<string, ChatLine>();
+    let last: ChatLine | undefined;
+    for (const item of timeline) {
+      if (item.kind !== "line") continue;
+      if (item.line.direction === "in") last = item.line;
+      else if (last) map.set(item.line.id, last);
+    }
+    return map;
+  }, [timeline]);
+
   useEffect(() => {
     bottom.current?.scrollIntoView({ block: "end" });
   }, [timeline.length, selected]);
+
+  // The owner's private chat on WeChat is for work, which the persona never applies to.
+  const canFix = (line: ChatLine) => {
+    const asked = answered.get(line.id);
+    return Boolean(asked) && !(conversation?.kind === "dm" && asked?.tier === "owner" && !conversation.personaInOwnerChat);
+  };
+
+  function keep(line: ChatLine, reply: string) {
+    const asked = answered.get(line.id);
+    if (!asked || !clip(asked.text) || !clip(reply)) return;
+    engine.send({ type: "persona.addExample", example: { said: clip(asked.text), reply: clip(reply) } });
+    setKept((ids) => new Set(ids).add(line.id));
+    setFixing(null);
+  }
 
   function submit(event?: FormEvent) {
     event?.preventDefault();
@@ -99,6 +136,37 @@ export function ChatPage({ engine, state }: { engine: EngineApi; state: EngineSt
                   <time>{formatTime(item.line.at)}</time>
                 </div>
                 <div className="bubble">{item.line.text}</div>
+                {fixing?.lineId === item.line.id ? (
+                  <div className="bubble-fix">
+                    <label className="visually-hidden" htmlFor={`fix-${item.line.id}`}>
+                      改成你想要的回复
+                    </label>
+                    <textarea
+                      id={`fix-${item.line.id}`}
+                      rows={2}
+                      maxLength={MAX_PERSONA_EXAMPLE_CHARS}
+                      autoFocus
+                      value={fixing.text}
+                      onChange={(event) => setFixing({ lineId: item.line.id, text: event.target.value })}
+                    />
+                    <div className="actions">
+                      <button type="button" className="button button-primary" disabled={!clip(fixing.text)} onClick={() => keep(item.line, fixing.text)}>
+                        存为示例
+                      </button>
+                      <button type="button" className="button" onClick={() => setFixing(null)}>
+                        取消
+                      </button>
+                    </div>
+                    <p className="panel-meta">
+                      会和上一条“{clip(answered.get(item.line.id)?.text ?? "")}”配成一组，加到人设的示例里。
+                      {state.persona.mode === "off" ? "人设现在是关的，要在“人设”页打开才生效。" : ""}
+                    </p>
+                  </div>
+                ) : item.line.direction === "out" && canFix(item.line) ? (
+                  <button type="button" className="link-button bubble-fix-link" disabled={kept.has(item.line.id)} onClick={() => setFixing({ lineId: item.line.id, text: item.line.text })}>
+                    {kept.has(item.line.id) ? "已存为示例" : "改成这样…"}
+                  </button>
+                ) : null}
               </div>
             ),
           )}

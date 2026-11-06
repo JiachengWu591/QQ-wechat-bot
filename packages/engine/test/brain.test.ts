@@ -313,6 +313,32 @@ describe("ApiBrain", () => {
     assert.deepEqual(task.calls[0]!.params.cache_control, { type: "ephemeral" });
   });
 
+  it("caches a long system prompt on the prompt itself, where the next message can reuse it", async () => {
+    const chat = fakeClient([say("好")]);
+    await new ApiBrain({ apiKey: "k", model: MODEL, client: chat.client }).reply(request({ profile: "chat", system: "人设", cacheSystem: true }));
+    assert.deepEqual(chat.calls[0]!.params.system, [{ type: "text", text: "人设", cache_control: { type: "ephemeral" } }]);
+    assert.equal(chat.calls[0]!.params.cache_control, undefined);
+    const plain = fakeClient([say("好")]);
+    await new ApiBrain({ apiKey: "k", model: MODEL, client: plain.client }).reply(request({ profile: "chat", system: "普通" }));
+    assert.equal(plain.calls[0]!.params.system, "普通");
+  });
+
+  it("leaves a task's caching as it is, which already covers the system prompt", async () => {
+    const task = fakeClient([say("好")]);
+    await new ApiBrain({ apiKey: "k", model: MODEL, client: task.client }).reply(request({ profile: "task", system: "任务", cacheSystem: true }));
+    assert.equal(task.calls[0]!.params.system, "任务");
+    assert.deepEqual(task.calls[0]!.params.cache_control, { type: "ephemeral" });
+  });
+
+  it("keeps the cached system prompt on every round of a turn", async () => {
+    const { client, calls } = fakeClient([toolUse("tool_a"), say("好")]);
+    await new ApiBrain({ apiKey: "k", model: MODEL, client }).reply(
+      request({ system: "人设", cacheSystem: true, tools: [{ name: "tool_a", description: "a", inputSchema: { type: "object", properties: {}, additionalProperties: false } }] }),
+    );
+    assert.equal(calls.length, 2);
+    assert.deepEqual(calls[1]!.params.system, calls[0]!.params.system);
+  });
+
   it("asks for the model chosen for this request, not its own default", async () => {
     const { client, calls } = fakeClient([say("好")]);
     await new ApiBrain({ apiKey: "k", model: MODEL, client }).reply(request({ model: "claude-sonnet-5-5" }));

@@ -1,18 +1,20 @@
 import { useEffect, useRef, useState } from "react";
-import { Activity, Inbox, LayoutDashboard, MessagesSquare, X } from "lucide-react";
+import { Activity, Inbox, LayoutDashboard, MessagesSquare, Sparkles, X } from "lucide-react";
 import { hideWindow, quitApp, reportRunning, subscribeShell } from "./shell.ts";
 import { ActivityPage } from "./pages/ActivityPage.tsx";
 import { ChatPage } from "./pages/ChatPage.tsx";
 import { OverviewPage } from "./pages/OverviewPage.tsx";
 import { PendingPage } from "./pages/PendingPage.tsx";
+import { PersonaPage } from "./pages/PersonaPage.tsx";
 import { useEngine } from "./useEngine.ts";
 
-type PageId = "overview" | "pending" | "chat" | "activity";
+type PageId = "overview" | "pending" | "chat" | "persona" | "activity";
 
 const pages = [
   { id: "overview", label: "总览", icon: LayoutDashboard },
   { id: "pending", label: "待确认", icon: Inbox },
   { id: "chat", label: "聊天", icon: MessagesSquare },
+  { id: "persona", label: "人设", icon: Sparkles },
   { id: "activity", label: "活动", icon: Activity },
 ] as const;
 
@@ -75,6 +77,8 @@ export function App() {
           <PendingPage engine={engine} state={engine.state} />
         ) : page === "chat" ? (
           <ChatPage engine={engine} state={engine.state} />
+        ) : page === "persona" ? (
+          <PersonaPage engine={engine} state={engine.state} />
         ) : (
           <ActivityPage entries={engine.activity} />
         )}

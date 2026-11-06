@@ -1,7 +1,18 @@
 // The hub: everything a message goes through between arriving and a reply leaving.
 import { EventEmitter } from "node:events";
 import { randomInt, randomUUID } from "node:crypto";
-import { modelOptions, WECHAT_WORK_CHANNEL_ID, workMentionProblem, workMessageProblem } from "@shu/protocol";
+import {
+  DEFAULT_PERSONA,
+  MAX_PERSONA_EXAMPLES,
+  modelOptions,
+  personaExampleSchema,
+  personaIsEmpty,
+  personaModeLabels,
+  personaSchema,
+  WECHAT_WORK_CHANNEL_ID,
+  workMentionProblem,
+  workMessageProblem,
+} from "@shu/protocol";
 import type {
   AccessEntry,
   ActivityEntry,
@@ -16,6 +27,8 @@ import type {
   InboundMessage,
   PairingView,
   PendingReply,
+  Persona,
+  PersonaExample,
   SimSender,
   Tier,
   WorkbenchStatus,
@@ -24,6 +37,7 @@ import type {
 import type { Brain, ToolOutcome } from "./brain.ts";
 import { atLeast, effectiveTier, RateLimiter, tierOf, type AccessList } from "./policy.ts";
 import { chatPrompt, systemPrompt } from "./prompt.ts";
+import { SIM_CHANNEL_ID } from "./sim.ts";
 import type { BudgetLane, Store } from "./store.ts";
 import { noInput, type LocalTool, type ToolContext } from "./tools.ts";
 import type { Adapter, AdapterConversation, AdapterMessage } from "./types.ts";
@@ -190,6 +204,7 @@ export class Engine extends EventEmitter<EngineEvents> {
         enabled: this.#channelEnabled.get(adapter.id) ?? false,
         status: this.#channelStatus.get(adapter.id) ?? { state: "stopped" },
         ...(adapter.botName?.() ? { botName: adapter.botName() as string } : {}),
+        ...(adapter.personaInOwnerChat ? { personaInOwnerChat: true } : {}),
         canLogin: Boolean(adapter.beginLogin),
         ...(this.#channelLogin.has(adapter.id) ? { login: this.#channelLogin.get(adapter.id) as ChannelLogin } : {}),
         conversations: this.#knownConversations(adapter.id).map((conversation): ConversationView => {
@@ -209,6 +224,7 @@ export class Engine extends EventEmitter<EngineEvents> {
       },
       brain: { ready: this.#brain !== null, model: this.#selectedModel() ?? "未配置" },
       runAtLogin: this.#runAtLogin(),
+      persona: this.#persona(),
       simSenders: this.#config.simSenders,
       access: this.#pairedAccess(),
       pairing: this.#activePairing(),
@@ -505,6 +521,38 @@ export class Engine extends EventEmitter<EngineEvents> {
     this.#store.setSetting("brain:model", option.id);
     this.#log("info", `模型切换为 ${option.label}，下一条消息开始生效`);
     this.#emitState();
+  }
+
+  // What the owner saved, or the first draft until they save their own.
+  #persona(): Persona {
+    const saved = personaSchema.safeParse(this.#store.getSetting("persona"));
+    return saved.success ? saved.data : DEFAULT_PERSONA;
+  }
+
+  setPersona(persona: Persona) {
+    const valid = personaSchema.parse(persona);
+    this.#store.setSetting("persona", valid);
+    this.#log("info", `人设已保存：${personaModeLabels[valid.mode]}，${valid.examples.length} 条示例`);
+    this.#emitState();
+  }
+
+  // A reply the owner rewrote in the console, kept as an example of how the bot should talk.
+  addPersonaExample(example: PersonaExample) {
+    const persona = this.#persona();
+    if (persona.examples.length >= MAX_PERSONA_EXAMPLES) throw new Error(`示例已经有 ${MAX_PERSONA_EXAMPLES} 条了，先删掉几条再加。`);
+    this.#store.setSetting("persona", { ...persona, examples: [...persona.examples, personaExampleSchema.parse(example)] });
+    this.#log("info", "人设里加了一条示例");
+    this.#emitState();
+  }
+
+  // Never for the owner's work, which wants the plain voice. A trial only shows in simulated chats,
+  // where nobody else sees it.
+  #personaFor(channelId: string, isWork: boolean): Persona | undefined {
+    if (isWork) return undefined;
+    const persona = this.#persona();
+    if (persona.mode === "off" || personaIsEmpty(persona)) return undefined;
+    if (persona.mode === "trial" && channelId !== SIM_CHANNEL_ID) return undefined;
+    return persona;
   }
 
   // A saved choice that's no longer offered falls back to the default.
@@ -840,12 +888,14 @@ export class Engine extends EventEmitter<EngineEvents> {
           : undefined,
     };
     const offered = this.#tools.filter((tool) => atLeast(tier, tool.minTier) && (!tool.needsSendFile || turn.canSendFiles));
+    const persona = this.#personaFor(trigger.channelId, isWork && !adapter.personaInOwnerChat);
 
     this.#inFlight.set(controller, `${trigger.channelId}:${trigger.conversationId}`);
     try {
       const result = await this.#brain.reply({
         model: this.#selectedModel() ?? this.#brain.model,
-        system: systemPrompt(botName, adapter.promptHint, isWork),
+        system: systemPrompt(botName, adapter.promptHint, isWork, persona),
+        ...(persona ? { cacheSystem: true } : {}),
         prompt: chatPrompt({ conversationTitle: title, kind: conversation.kind, history, current: trigger }),
         tools: offered.map(({ name, description, inputSchema }) => ({ name, description, inputSchema })),
         profile: isWork ? "task" : "chat",

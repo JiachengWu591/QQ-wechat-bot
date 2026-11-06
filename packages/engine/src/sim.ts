@@ -20,6 +20,8 @@ export const simConversations: AdapterConversation[] = [
 export class SimAdapter implements Adapter {
   readonly id = SIM_CHANNEL_ID;
   readonly name = "模拟聊天";
+  // Like QQ, so a persona tried out here behaves as it will there.
+  readonly personaInOwnerChat = true;
   sent: OutboundText[] = [];
   sentFiles: { conversationId: string; path: string; fileName: string }[] = [];
   // Lets a test make the platform reject a message.

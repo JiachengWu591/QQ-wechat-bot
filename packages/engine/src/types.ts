@@ -34,6 +34,8 @@ export interface Adapter {
   readonly name: string;
   // Added to the system prompt, for what the model needs to know about this platform.
   readonly promptHint?: string;
+  // Where the owner's own private chat is for talking rather than work, so it takes the persona.
+  readonly personaInOwnerChat?: boolean;
   // Conversations that always exist. Others are discovered as messages arrive.
   conversations(): AdapterConversation[];
   botName?(): string | undefined;

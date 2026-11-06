@@ -1,5 +1,8 @@
 // The shapes shared by the engine and the console.
 import { z } from "zod";
+import { personaExampleSchema, personaSchema, type Persona } from "./persona.ts";
+
+export * from "./persona.ts";
 
 export type Tier = "owner" | "trusted" | "member";
 
@@ -91,6 +94,8 @@ export type ChannelView = {
   enabled: boolean;
   status: ChannelStatus;
   botName?: string;
+  // The owner's own private chat here takes the persona, rather than the plain voice for work.
+  personaInOwnerChat?: boolean;
   canLogin: boolean;
   login?: ChannelLogin;
   conversations: ConversationView[];
@@ -194,6 +199,7 @@ export type EngineState = {
   brain: { ready: boolean; model: string };
   // Whether the master switch comes on by itself when the app starts with Windows.
   runAtLogin: boolean;
+  persona: Persona;
   simSenders: SimSender[];
   access: AccessEntry[];
   pairing: PairingView | null;
@@ -228,6 +234,8 @@ export const commandSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("workbench.setEnabled"), enabled: z.boolean() }),
   z.object({ type: z.literal("workbench.allowGroup"), name: z.string().trim().min(1).max(60) }),
   z.object({ type: z.literal("workbench.removeGroup"), name: z.string().min(1).max(60) }),
+  z.object({ type: z.literal("persona.set"), persona: personaSchema }),
+  z.object({ type: z.literal("persona.addExample"), example: personaExampleSchema }),
   z.object({
     type: z.literal("sim.send"),
     conversationId: id,

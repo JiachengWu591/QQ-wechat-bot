@@ -21,6 +21,9 @@ export type BrainRequest = {
   profile: BrainProfile;
   // How many searches each model call may make. Zero leaves search out entirely.
   webSearchUses: number;
+  // The system prompt is long and the same on every message, like a persona's: worth caching even
+  // for a one-call chat reply, since the next message in the conversation reuses it.
+  cacheSystem?: boolean;
   signal: AbortSignal;
   // Called after every API response, so spending is known even if the turn never finishes.
   onCost(costUsd: number): void;
@@ -134,6 +137,10 @@ export class ApiBrain implements Brain {
       ...request.tools.map((tool) => ({ name: tool.name, description: tool.description, input_schema: tool.inputSchema, eager_input_streaming: true })),
       ...(request.webSearchUses > 0 ? [SEARCH_GATE] : []),
     ];
+    // The breakpoint goes on the system prompt itself: placed automatically, it would land on the
+    // message, which is different every time, and nothing would be reused.
+    const system: string | Anthropic.Beta.BetaTextBlockParam[] =
+      request.cacheSystem && !profile.cache ? [{ type: "text", text: request.system, cache_control: { type: "ephemeral" } }] : request.system;
     let searchAdded = false;
     let costUsd = 0;
     let webSearches = 0;
@@ -152,7 +159,7 @@ export class ApiBrain implements Brain {
               ...(MODELS_WITHOUT_FALLBACK.has(request.model) ? {} : { betas: ["server-side-fallback-2026-07-01"], fallbacks: "default" as const }),
               output_config: { effort: profile.effort },
               ...(profile.cache ? { cache_control: { type: "ephemeral" as const } } : {}),
-              system: request.system,
+              system,
               messages,
               ...(tools.length ? { tools } : {}),
             },

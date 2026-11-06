@@ -4,14 +4,16 @@
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { existsSync, mkdirSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const token = randomBytes(24).toString("hex");
 const enginePort = process.env.SHU_ENGINE_PORT ?? "47821";
 const webPort = process.env.SHU_WEB_PORT ?? "5173";
-const dataDir = join(root, ".dev", "data");
+// Another folder keeps a second copy, such as one with only the simulated chats, apart from this
+// one. Relative to the repository, since the engine runs from its own folder.
+const dataDir = process.env.SHU_DATA_DIR ? resolve(root, process.env.SHU_DATA_DIR) : join(root, ".dev", "data");
 mkdirSync(dataDir, { recursive: true });
 
 const envFile = process.env.SHU_ENV_FILE ?? join(root, "spikes", ".env.local");
