@@ -4,6 +4,9 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { ApiBrain } from "./brain.ts";
 import { Engine } from "./engine.ts";
+import { groupTools } from "./fun.ts";
+import { Pighub } from "./pighub.ts";
+import { poolTool, type GroupChoice } from "./pool.ts";
 import { QqAdapter } from "./qq.ts";
 import { startServer } from "./server.ts";
 import { SIM_CHANNEL_ID, SimAdapter, simSenders } from "./sim.ts";
@@ -32,19 +35,20 @@ const channels = new Set((process.env.SHU_CHANNELS ?? "qq,wechat,sim").split(","
 
 const { SHU_QQ_APP_ID: qqAppId, SHU_QQ_APP_SECRET: qqAppSecret } = process.env;
 const adapters: Adapter[] = [
-  ...(channels.has("qq") && qqAppId && qqAppSecret ? [new QqAdapter({ appId: qqAppId, appSecret: qqAppSecret })] : []),
+  ...(channels.has("qq") && qqAppId && qqAppSecret ? [new QqAdapter({ appId: qqAppId, appSecret: qqAppSecret, cache: store })] : []),
   ...(channels.has("wechat") ? [new WeChatAdapter({ sessionStore: fileSessionStore(join(dataDir, "wechat-session.json")) })] : []),
   ...(channels.has("sim") ? [new SimAdapter()] : []),
 ];
 
 const workspace = new Workspace(join(dataDir, "workspace"));
 
-const engine = new Engine({
+const engine: Engine = new Engine({
   store,
   brain,
   adapters,
   workspace,
-  tools: [currentTimeTool, ...workspaceTools(workspace)],
+  // The pool tool names groups as the console shows them, which the engine knows once it exists.
+  tools: [currentTimeTool, ...groupTools(store, { workspace }), poolTool(store, workspace, { groups: (): GroupChoice[] => engine.groupConversations(), pighub: new Pighub() }), ...workspaceTools(workspace)],
   // Available here, but off until the owner turns it on in the console.
   ...(process.platform === "win32" ? { workbench: { screen: new WxHelperScreen(), intervalMs: Number(process.env.SHU_WECHAT_SCAN_SECONDS ?? 15) * 1000 } } : {}),
   config: {

@@ -21,6 +21,8 @@ export type BrainRequest = {
   profile: BrainProfile;
   // How many searches each model call may make. Zero leaves search out entirely.
   webSearchUses: number;
+  // How many pages each model call may fetch. Only offered when the message has a link in it.
+  webFetchUses?: number;
   // The system prompt is long and the same on every message, like a persona's: worth caching even
   // for a one-call chat reply, since the next message in the conversation reuses it.
   cacheSystem?: boolean;
@@ -35,6 +37,7 @@ export type BrainResult = {
   model: string;
   costUsd: number;
   webSearches: number;
+  webFetches?: number;
   refused: boolean;
   // The reply hit the output limit, so it stops mid-way.
   truncated: boolean;
@@ -97,6 +100,21 @@ const SEARCH_GATE: Anthropic.Beta.BetaTool = {
   input_schema: { type: "object", properties: {}, additionalProperties: false },
 };
 
+// A page someone linked to. Only links typed in the conversation can be fetched, never ones a
+// fetched page or search result points to, so a page can't send the bot on somewhere else.
+const MAX_FETCH_CONTENT_TOKENS = 12_000;
+
+export function webFetchTool(model: string, uses: number): Anthropic.Beta.BetaToolUnion {
+  const common = {
+    name: "web_fetch" as const,
+    max_uses: uses,
+    max_content_tokens: MAX_FETCH_CONTENT_TOKENS,
+    url_sources: { user_input: { type: "all" as const }, server_tool_results: { type: "none" as const }, client_tool_results: { type: "none" as const } },
+  };
+  // The version that filters pages with code runs only on the larger models.
+  return model === "claude-haiku-5-5" ? { type: "web_fetch_20250910", ...common } : { type: "web_fetch_20260209", ...common };
+}
+
 type Usage = {
   input_tokens: number;
   output_tokens: number;
@@ -136,6 +154,7 @@ export class ApiBrain implements Brain {
       // it receives, since nothing else does for streamed input.
       ...request.tools.map((tool) => ({ name: tool.name, description: tool.description, input_schema: tool.inputSchema, eager_input_streaming: true })),
       ...(request.webSearchUses > 0 ? [SEARCH_GATE] : []),
+      ...(request.webFetchUses ? [webFetchTool(request.model, request.webFetchUses)] : []),
     ];
     // The breakpoint goes on the system prompt itself: placed automatically, it would land on the
     // message, which is different every time, and nothing would be reused.
@@ -144,6 +163,7 @@ export class ApiBrain implements Brain {
     let searchAdded = false;
     let costUsd = 0;
     let webSearches = 0;
+    let webFetches = 0;
     let badJsonRetries = 0;
 
     for (let round = 0; round < profile.maxRounds; round++) {
@@ -177,6 +197,8 @@ export class ApiBrain implements Brain {
       const searches = response.usage.server_tool_use?.web_search_requests ?? 0;
       const cost = tokenCost(response.model, response.usage) + searches * USD_PER_SEARCH;
       webSearches += searches;
+      // Fetching costs nothing beyond the page's tokens, which are counted above.
+      webFetches += response.usage.server_tool_use?.web_fetch_requests ?? 0;
       costUsd += cost;
       request.onCost(cost);
 
@@ -219,6 +241,7 @@ export class ApiBrain implements Brain {
         model: response.model,
         costUsd,
         webSearches,
+        webFetches,
         refused: response.stop_reason === "refusal",
         truncated: response.stop_reason === "max_tokens",
       };

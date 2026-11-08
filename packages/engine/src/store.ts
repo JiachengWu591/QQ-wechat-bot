@@ -36,7 +36,63 @@ const schema = `
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
   );
+  CREATE TABLE IF NOT EXISTS image_sightings (
+    channel_id TEXT NOT NULL,
+    conversation_id TEXT NOT NULL,
+    fingerprint TEXT NOT NULL,
+    count INTEGER NOT NULL,
+    senders TEXT NOT NULL,
+    first_at INTEGER NOT NULL,
+    last_at INTEGER NOT NULL,
+    file TEXT,
+    settled INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (channel_id, conversation_id, fingerprint)
+  );
 `;
+
+// How often a picture has been posted in a group, for ranking the gacha pool's candidates. Who
+// posted it is kept only to count different people, at most this many.
+const MAX_SENDERS_KEPT = 50;
+
+export type Sighting = {
+  channelId: string;
+  conversationId: string;
+  fingerprint: string;
+  count: number;
+  senders: number;
+  firstAt: number;
+  lastAt: number;
+  // A copy kept as a candidate, in the workspace.
+  file?: string;
+  // The owner has added it to the pool or turned it down.
+  settled: boolean;
+};
+
+type SightingRow = {
+  channel_id: string;
+  conversation_id: string;
+  fingerprint: string;
+  count: number;
+  senders: string;
+  first_at: number;
+  last_at: number;
+  file: string | null;
+  settled: number;
+};
+
+function toSighting(row: SightingRow): Sighting {
+  return {
+    channelId: row.channel_id,
+    conversationId: row.conversation_id,
+    fingerprint: row.fingerprint,
+    count: row.count,
+    senders: (JSON.parse(row.senders) as string[]).length,
+    firstAt: row.first_at,
+    lastAt: row.last_at,
+    ...(row.file ? { file: row.file } : {}),
+    settled: row.settled === 1,
+  };
+}
 
 type MessageRow = {
   id: string;
@@ -48,6 +104,7 @@ type MessageRow = {
   text: string;
   at: number;
   tier: string;
+  tools: string | null;
 };
 
 type ActivityRow = {
@@ -79,6 +136,7 @@ function toLine(row: MessageRow): ChatLine {
     text: row.text,
     at: row.at,
     tier: row.tier as Tier,
+    ...(row.tools ? { tools: JSON.parse(row.tools) as string[] } : {}),
   };
 }
 
@@ -99,6 +157,9 @@ export class Store {
   constructor(path: string) {
     this.#db = new DatabaseSync(path);
     this.#db.exec(schema);
+    // Added after the first databases were made, which get it on opening.
+    const columns = this.#db.prepare(`PRAGMA table_info(messages)`).all() as Array<{ name: string }>;
+    if (!columns.some((column) => column.name === "tools")) this.#db.exec(`ALTER TABLE messages ADD COLUMN tools TEXT`);
   }
 
   close() {
@@ -108,10 +169,10 @@ export class Store {
   addMessage(line: ChatLine) {
     this.#db
       .prepare(
-        `INSERT OR IGNORE INTO messages (id, channel_id, conversation_id, direction, sender_id, sender_name, text, at, tier)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT OR IGNORE INTO messages (id, channel_id, conversation_id, direction, sender_id, sender_name, text, at, tier, tools)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
-      .run(line.id, line.channelId, line.conversationId, line.direction, line.senderId, line.senderName, line.text, line.at, line.tier);
+      .run(line.id, line.channelId, line.conversationId, line.direction, line.senderId, line.senderName, line.text, line.at, line.tier, line.tools?.length ? JSON.stringify(line.tools) : null);
   }
 
   // Oldest first.
@@ -147,6 +208,59 @@ export class Store {
   purgeBefore(at: number) {
     this.#db.prepare(`DELETE FROM messages WHERE at < ?`).run(at);
     this.#db.prepare(`DELETE FROM activity WHERE at < ?`).run(at);
+    // A candidate the owner hasn't looked at yet is kept, however old.
+    this.#db.prepare(`DELETE FROM image_sightings WHERE last_at < ? AND file IS NULL`).run(at);
+  }
+
+  // Counts one more posting of a picture in a group, and gives back where it stands.
+  recordSighting(channelId: string, conversationId: string, fingerprint: string, senderId: string, at: number): Sighting {
+    const where = `channel_id = ? AND conversation_id = ? AND fingerprint = ?`;
+    const row = this.#db.prepare(`SELECT * FROM image_sightings WHERE ${where}`).get(channelId, conversationId, fingerprint) as SightingRow | undefined;
+    if (!row) {
+      this.#db
+        .prepare(`INSERT INTO image_sightings (channel_id, conversation_id, fingerprint, count, senders, first_at, last_at) VALUES (?, ?, ?, 1, ?, ?, ?)`)
+        .run(channelId, conversationId, fingerprint, JSON.stringify([senderId]), at, at);
+    } else {
+      const senders = JSON.parse(row.senders) as string[];
+      if (!senders.includes(senderId) && senders.length < MAX_SENDERS_KEPT) senders.push(senderId);
+      this.#db.prepare(`UPDATE image_sightings SET count = count + 1, senders = ?, last_at = ? WHERE ${where}`).run(JSON.stringify(senders), at, channelId, conversationId, fingerprint);
+    }
+    return toSighting(this.#db.prepare(`SELECT * FROM image_sightings WHERE ${where}`).get(channelId, conversationId, fingerprint) as SightingRow);
+  }
+
+  setSightingFile(channelId: string, conversationId: string, fingerprint: string, file: string) {
+    this.#db.prepare(`UPDATE image_sightings SET file = ? WHERE channel_id = ? AND conversation_id = ? AND fingerprint = ?`).run(file, channelId, conversationId, fingerprint);
+  }
+
+  // Added to the pool or turned down: it's no longer offered, in any group.
+  settleSighting(fingerprint: string) {
+    this.#db.prepare(`UPDATE image_sightings SET settled = 1, file = NULL WHERE fingerprint = ?`).run(fingerprint);
+  }
+
+  // Pictures kept as candidates and not yet settled, one per picture with its postings in every
+  // group added up, most posted first.
+  candidates(): Sighting[] {
+    const rows = this.#db
+      .prepare(`SELECT * FROM image_sightings WHERE settled = 0 AND fingerprint IN (SELECT fingerprint FROM image_sightings WHERE file IS NOT NULL AND settled = 0)`)
+      .all() as unknown as SightingRow[];
+    const byPicture = new Map<string, Sighting>();
+    for (const sighting of rows.map(toSighting)) {
+      const seen = byPicture.get(sighting.fingerprint);
+      byPicture.set(
+        sighting.fingerprint,
+        seen
+          ? {
+              ...seen,
+              ...(seen.file ? {} : sighting.file ? { file: sighting.file } : {}),
+              count: seen.count + sighting.count,
+              senders: seen.senders + sighting.senders,
+              firstAt: Math.min(seen.firstAt, sighting.firstAt),
+              lastAt: Math.max(seen.lastAt, sighting.lastAt),
+            }
+          : sighting,
+      );
+    }
+    return [...byPicture.values()].sort((a, b) => b.count - a.count || b.senders - a.senders || a.firstAt - b.firstAt);
   }
 
   addCost(day: string, costUsd: number, lane: BudgetLane = "shared") {

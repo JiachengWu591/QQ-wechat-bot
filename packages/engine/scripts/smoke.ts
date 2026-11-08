@@ -6,7 +6,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Jimp } from "jimp";
 import { prepareImage } from "../src/images.ts";
+import { diceGif, gachaPng } from "../src/render.ts";
 import { Store } from "../src/store.ts";
+import { webpToPng } from "../src/webp.ts";
 import { Workspace, workspaceTools } from "../src/workspace.ts";
 import { WxHelperScreen } from "../src/wx-screen.ts";
 
@@ -30,6 +32,16 @@ try {
   const { parts } = await prepareImage(Buffer.from(tall));
   assert.ok(parts.length > 1, "a tall picture is cut into pieces");
 
+  // The renderer is found beside the bundle, and draws a die and a pull.
+  const die = await diceGif(5);
+  assert.equal(die.data.subarray(0, 6).toString("latin1"), "GIF89a");
+  const pulled = await gachaPng("冒烟 的单抽 · 角色池", "已 1 抽未出五星", [{ rarity: 5, name: "夜航者", tag: "UP" }]);
+  assert.equal(pulled.data.subarray(1, 4).toString("latin1"), "PNG");
+
+  // The WebP decoder is found beside the bundle, and turns one into PNG.
+  const webp = Buffer.from("UklGRiQAAABXRUJQVlA4TBcAAAAvd0AWAAdQ5po1s/9hABLC//1SRP9TogA=", "base64");
+  assert.equal((await webpToPng(webp)).subarray(1, 4).toString("latin1"), "PNG");
+
   // The helper is found beside the bundle, and its own reading code runs.
   const screen = new WxHelperScreen();
   try {
@@ -38,7 +50,7 @@ try {
   } finally {
     await screen.stop();
   }
-  console.log("smoke test passed: SQLite, Excel, Word, images and the WeChat helper all work from the bundle");
+  console.log("smoke test passed: SQLite, Excel, Word, images, drawing, WebP and the WeChat helper all work from the bundle");
 } finally {
   rmSync(root, { recursive: true, force: true });
 }

@@ -1,7 +1,7 @@
 // The one folder the bot's file tools can touch. There's deliberately no shell: making a
 // spreadsheet or a report doesn't need one, and without it a poisoned document or web page
 // has nothing dangerous to reach for.
-import { mkdir, readdir, readFile, realpath, stat, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { basename, extname, join, relative, resolve, sep, win32 } from "node:path";
 import ExcelJS from "exceljs";
 import { AlignmentType, Document, HeadingLevel, LevelFormat, Packer, Paragraph, Table, TableCell, TableRow, TextRun, WidthType } from "docx";
@@ -104,6 +104,34 @@ export class Workspace {
     const path = await this.#freePath("files", `${base}${extension}`);
     await writeFile(path, data);
     return this.relative(path);
+  }
+
+  // A picture for the gacha pool, copied from something the owner sent. Kept apart from inbox/.
+  async saveGacha(name: string, extension: string, data: Buffer): Promise<string> {
+    const path = await this.#freePath("gacha", `${safeFileName(name, "card")}${extension}`);
+    await writeFile(path, data);
+    return this.relative(path);
+  }
+
+  // A picture posted in a group that might go into the pool, named after its fingerprint.
+  async saveCandidate(fingerprint: string, extension: string, data: Buffer): Promise<string> {
+    const path = await this.#freePath("candidates", `${safeFileName(fingerprint, "candidate")}${extension}`);
+    await writeFile(path, data);
+    return this.relative(path);
+  }
+
+  // Only candidates are removed this way, judged by where the path really leads.
+  async removeCandidate(relativePath: string): Promise<void> {
+    const target = await this.resolve(relativePath);
+    if (!target.startsWith(join(this.root, "candidates") + sep)) throw new WorkspaceError("只能删除候选图。");
+    await rm(target, { force: true });
+  }
+
+  // Only the gacha pool's own copies are ever removed, judged by where the path really leads.
+  async removeGacha(relativePath: string): Promise<void> {
+    const target = await this.resolve(relativePath);
+    if (!target.startsWith(join(this.root, "gacha") + sep)) throw new WorkspaceError("只能删除卡池里的图。");
+    await rm(target, { force: true });
   }
 
   relative(absolutePath: string): string {

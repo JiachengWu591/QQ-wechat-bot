@@ -313,6 +313,36 @@ describe("ApiBrain", () => {
     assert.deepEqual(task.calls[0]!.params.cache_control, { type: "ephemeral" });
   });
 
+  it("offers to read a page only when asked to, fetching only links someone typed", async () => {
+    const plain = fakeClient([say("好")]);
+    await new ApiBrain({ apiKey: "k", model: MODEL, client: plain.client }).reply(request());
+    assert.ok(!toolNames(plain.calls[0]!).includes("web_fetch"));
+    const linked = fakeClient([say("好")]);
+    await new ApiBrain({ apiKey: "k", model: MODEL, client: linked.client }).reply(request({ webFetchUses: 3 }));
+    const fetch = linked.calls[0]!.params.tools.find((tool: any) => tool.name === "web_fetch");
+    assert.deepEqual(fetch, {
+      type: "web_fetch_20260209",
+      name: "web_fetch",
+      max_uses: 3,
+      max_content_tokens: 12000,
+      url_sources: { user_input: { type: "all" }, server_tool_results: { type: "none" }, client_tool_results: { type: "none" } },
+    });
+  });
+
+  it("uses the fetch tool Haiku supports", async () => {
+    const { client, calls } = fakeClient([say("好")]);
+    await new ApiBrain({ apiKey: "k", model: MODEL, client }).reply(request({ model: "claude-haiku-5-5", webFetchUses: 1 }));
+    assert.equal(calls[0]!.params.tools.find((tool: any) => tool.name === "web_fetch").type, "web_fetch_20250910");
+  });
+
+  it("counts the pages read, at no charge beyond their tokens", async () => {
+    const usage = { input_tokens: 1000, output_tokens: 100, server_tool_use: { web_fetch_requests: 2, web_search_requests: 0 } };
+    const { client } = fakeClient([{ ...say("好"), usage }]);
+    const result = await new ApiBrain({ apiKey: "k", model: MODEL, client }).reply(request({ webFetchUses: 3 }));
+    assert.equal(result.webFetches, 2);
+    assert.equal(result.costUsd, tokenCost(MODEL, usage));
+  });
+
   it("caches a long system prompt on the prompt itself, where the next message can reuse it", async () => {
     const chat = fakeClient([say("好")]);
     await new ApiBrain({ apiKey: "k", model: MODEL, client: chat.client }).reply(request({ profile: "chat", system: "人设", cacheSystem: true }));

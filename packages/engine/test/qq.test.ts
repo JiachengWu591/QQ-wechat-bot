@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { afterEach, describe, it, type TestContext } from "node:test";
@@ -6,7 +7,8 @@ import type { ChannelStatus, InboundMessage } from "@shu/protocol";
 import { WebSocketServer, type WebSocket } from "ws";
 import { describeNetworkError, networkErrorCode } from "../src/net.ts";
 import { attachmentUrl, prepareContent, QqAdapter, QqApiError } from "../src/qq.ts";
-import type { Adapter, AdapterMessage } from "../src/types.ts";
+import { Store } from "../src/store.ts";
+import type { Adapter, AdapterMessage, ChatImage, SettingsStore } from "../src/types.ts";
 import { WeChatAdapter } from "../src/wechat.ts";
 
 describe("where the owner talks", () => {
@@ -58,14 +60,19 @@ class FakeQq {
   sendAttempts = 0;
   // Files a message links to, by path.
   media = new Map<string, { status?: number; body: Buffer }>();
+  // Pictures the bot uploaded: rich media, and materials step by step.
+  uploads: SentRequest[] = [];
+  materials: Array<{ step: string; body: any }> = [];
+  puts: Array<{ path: string; type: string | undefined; bytes: number }> = [];
   #acceptedReplies = new Set<string>();
   #seq = 0;
 
   constructor() {
     this.http = createServer((req, res) => {
-      let raw = "";
-      req.on("data", (chunk) => (raw += chunk));
+      const chunks: Buffer[] = [];
+      req.on("data", (chunk: Buffer) => chunks.push(chunk));
       req.on("end", () => {
+        const raw = Buffer.concat(chunks).toString("utf8");
         const respond = (status: number, body: unknown) => {
           res.writeHead(status, { "Content-Type": "application/json" });
           res.end(JSON.stringify(body));
@@ -74,6 +81,23 @@ class FakeQq {
         if (req.url?.startsWith("/media/")) {
           res.writeHead(file?.status ?? (file ? 200 : 404), { "Content-Type": "application/octet-stream" });
           return res.end(file?.body ?? Buffer.alloc(0));
+        }
+        if (req.url?.endsWith("/files")) {
+          this.uploads.push({ path: req.url, body: JSON.parse(raw) });
+          return respond(200, { file_uuid: "uuid", file_info: `info-${this.uploads.length}`, ttl: 300 });
+        }
+        if (req.url === "/v2/media-images/prepare") {
+          this.materials.push({ step: "prepare", body: JSON.parse(raw) });
+          return respond(200, { upload_id: `upload-${this.materials.length}`, presigned_url: `http://127.0.0.1:${this.port}/cos/${this.materials.length}`, expires_in: 3600 });
+        }
+        if (req.url?.startsWith("/cos/")) {
+          this.puts.push({ path: req.url, type: req.headers["content-type"], bytes: Buffer.concat(chunks).length });
+          res.writeHead(200, { ETag: '"etag-of-file"' });
+          return res.end();
+        }
+        if (req.url === "/v2/media-images/complete") {
+          this.materials.push({ step: "complete", body: JSON.parse(raw) });
+          return respond(200, { image_id: "image", url: `qqbot-media://image/v1/token-${this.puts.length}`, ttl: 7776000 });
         }
         if (req.url === "/app/getAppAccessToken") {
           this.tokenRequests++;
@@ -173,12 +197,12 @@ describe("QQ adapter", () => {
   const statuses: ChannelStatus[] = [];
   const messages: InboundMessage[] = [];
 
-  async function connect(backoffMs = 5) {
+  async function connect(backoffMs = 5, cache?: SettingsStore) {
     fake = new FakeQq();
     await fake.listen();
     statuses.length = 0;
     messages.length = 0;
-    adapter = new QqAdapter({ appId: "app", appSecret: "secret", apiBase: `http://127.0.0.1:${fake.port}`, backoffMs });
+    adapter = new QqAdapter({ appId: "app", appSecret: "secret", apiBase: `http://127.0.0.1:${fake.port}`, backoffMs, ...(cache ? { cache } : {}) });
     await adapter.start({ onMessage: (message) => messages.push(message), onStatus: (status) => statuses.push(status) });
     await until(() => statuses.at(-1)?.state === "connected", "connected");
   }
@@ -278,6 +302,34 @@ describe("QQ adapter", () => {
     assert.equal(messages[0]!.text, "[图片]");
   });
 
+  it("passes on a group's pictures by fingerprint, to fetch only if asked", async () => {
+    await connect();
+    fake.media.set("/media/pig", { body: Buffer.from("pig-bytes") });
+    fake.dispatch(
+      "GROUP_MESSAGE_CREATE",
+      groupEvent({
+        content: "",
+        attachments: [
+          { content_type: "image/gif", filename: "1be2f9a084ebae11f4d510525f5b39cb.gif", url: `http://127.0.0.1:${fake.port}/media/pig` },
+          { content_type: "image/png", filename: "not-a-fingerprint.png", url: `http://127.0.0.1:${fake.port}/media/x` },
+          { content_type: "file", filename: "0123456789abcdef0123456789abcdef.zip", url: `http://127.0.0.1:${fake.port}/media/y` },
+        ],
+      }),
+    );
+    await until(() => messages.length === 1, "message");
+    const message = messages[0] as AdapterMessage;
+    assert.equal(message.text, "[图片] [图片] [文件 0123456789abcdef0123456789abcdef.zip]");
+    assert.deepEqual(message.seenImages?.map((image) => image.fingerprint), ["1BE2F9A084EBAE11F4D510525F5B39CB"]);
+    assert.deepEqual(await message.seenImages![0]!.fetch(), Buffer.from("pig-bytes"));
+  });
+
+  it("doesn't count pictures in private chats", async () => {
+    await connect();
+    fake.dispatch("C2C_MESSAGE_CREATE", { id: "dm-pig", content: "", author: { id: USER, user_openid: USER }, attachments: [{ content_type: "image/png", filename: "1be2f9a084ebae11f4d510525f5b39cb.png", url: `http://127.0.0.1:${fake.port}/media/p` }] });
+    await until(() => messages.length === 1, "message");
+    assert.equal((messages[0] as AdapterMessage).seenImages, undefined);
+  });
+
   it("keeps describing a group's attachments, which are never fetched", async () => {
     await connect();
     fake.dispatch("GROUP_MESSAGE_CREATE", groupEvent({ content: "看", attachments: [{ content_type: "image/png", url: `http://127.0.0.1:${fake.port}/media/a.png` }] }));
@@ -345,6 +397,91 @@ describe("QQ adapter", () => {
       fake.dispatch("C2C_MESSAGE_CREATE", dm({ attachments: [{ content_type: "image/png", url: link("/media/huge.png") }] }));
       await until(() => messages.length === 1, "message");
       await assert.rejects((messages[0] as AdapterMessage).attachments![0]!.download(), /30 MB/);
+    });
+  });
+
+  describe("pictures and cards", () => {
+    const png: ChatImage = { data: Buffer.from("\x89PNG-made-for-this"), mediaType: "image/png", width: 420, height: 390, alt: "小明 的单抽 · 角色池" };
+    const die = (face: number): ChatImage => ({ data: Buffer.from(`GIF89a-${face}`), mediaType: "image/gif", width: 160, height: 160, alt: `骰子 ${face} 点`, reuseKey: `dice-d6-v1-${face}` });
+    const dmTarget = { channelId: "qq", conversationId: USER, conversationKind: "dm" as const, replyToId: "dm-asked" };
+    const groupTarget = { channelId: "qq", conversationId: GROUP, conversationKind: "group" as const, replyToId: "g-asked" };
+
+    async function asked() {
+      fake.dispatch("C2C_MESSAGE_CREATE", { id: "dm-asked", content: "抽一发", author: { id: USER, user_openid: USER } });
+      fake.dispatch("GROUP_AT_MESSAGE_CREATE", groupEvent({ id: "g-asked", content: "掷骰子" }));
+      await until(() => messages.length === 2, "the messages being answered");
+    }
+
+    it("uploads a picture made for one message as rich media, without sending, then replies with it", async () => {
+      await connect();
+      await asked();
+      await adapter.sendImages(dmTarget, [png], "小明 的单抽");
+      assert.deepEqual(fake.uploads, [
+        { path: `/v2/users/${USER}/files`, body: { file_type: 1, file_name: "小明的单抽·角色池.png", file_data: png.data.toString("base64"), srv_send_msg: false } },
+      ]);
+      assert.deepEqual(fake.sent, [{ path: `/v2/users/${USER}/messages`, body: { msg_type: 7, media: { file_info: "info-1" }, content: "小明 的单抽", msg_id: "dm-asked", msg_seq: 1 } }]);
+    });
+
+    it("uploads a picture that's the same every time once, as a material, and shows it in Markdown", async () => {
+      const cache = new Store(":memory:");
+      await connect(5, cache);
+      await asked();
+      await adapter.sendImages(groupTarget, [die(4), die(1)], "合计 5");
+      assert.deepEqual(
+        fake.materials.filter((entry) => entry.step === "prepare").map((entry) => entry.body),
+        [4, 1].map((face) => ({
+          file_name: `dice-d6-v1-${face}.gif`,
+          file_size: die(face).data.length,
+          content_type: "image/gif",
+          md5: createHash("md5").update(die(face).data).digest("hex"),
+          sha1: createHash("sha1").update(die(face).data).digest("hex"),
+        })),
+      );
+      assert.deepEqual(fake.puts.map((put) => put.type), ["image/gif", "image/gif"]);
+      assert.deepEqual(fake.puts.map((put) => put.bytes), [die(4).data.length, die(1).data.length]);
+      assert.deepEqual(fake.materials.filter((entry) => entry.step === "complete").map((entry) => entry.body), [
+        { upload_id: "upload-1", md5: "etag-of-file" },
+        { upload_id: "upload-3", md5: "etag-of-file" },
+      ]);
+      assert.deepEqual(fake.sent.at(-1), {
+        path: `/v2/groups/${GROUP}/messages`,
+        body: {
+          msg_type: 2,
+          markdown: { content: "![骰子 4 点 #160px #160px](qqbot-media://image/v1/token-1)![骰子 1 点 #160px #160px](qqbot-media://image/v1/token-2)\n\n合计 5" },
+          msg_id: "g-asked",
+          msg_seq: 1,
+        },
+      });
+
+      // Shown again from what was kept, even by a new run, without uploading anything.
+      const again = new QqAdapter({ appId: "app", appSecret: "secret", apiBase: `http://127.0.0.1:${fake.port}`, cache });
+      await again.sendImages({ ...groupTarget, replyToId: undefined }, [die(4)]);
+      assert.equal(fake.materials.length, 4);
+      assert.match(fake.sent.at(-1)!.body.markdown.content, /^!\[骰子 4 点 #160px #160px\]\(qqbot-media:\/\/image\/v1\/token-1\)$/);
+    });
+
+    it("uploads a kept picture again once it's close to expiring", async () => {
+      const cache = new Store(":memory:");
+      cache.setSetting("qq:material:dice-d6-v1-4", { url: "qqbot-media://image/v1/old", expiresAt: Date.now() + 60_000, ttlMs: 7776000_000 });
+      await connect(5, cache);
+      await adapter.sendImages({ ...groupTarget, replyToId: undefined }, [die(4)]);
+      assert.equal(fake.materials.length, 2);
+      assert.doesNotMatch(fake.sent.at(-1)!.body.markdown.content, /old/);
+    });
+
+    it("won't upload an animation that isn't reused, since the platform keeps only 100", async () => {
+      await connect();
+      await assert.rejects(adapter.sendImages(groupTarget, [{ ...die(3), reuseKey: undefined }]), /不能作为素材上传/);
+      assert.deepEqual(fake.materials, []);
+    });
+
+    it("sends a card as Markdown, as a reply, without links", async () => {
+      await connect();
+      await asked();
+      await adapter.sendCard(groupTarget, "## 📊 吃啥\n\n**1. 火锅** 看 https://example.com");
+      assert.deepEqual(fake.sent, [
+        { path: `/v2/groups/${GROUP}/messages`, body: { msg_type: 2, markdown: { content: "## 📊 吃啥\n\n**1. 火锅** 看 （链接已省略）" }, msg_id: "g-asked", msg_seq: 1 } },
+      ]);
     });
   });
 

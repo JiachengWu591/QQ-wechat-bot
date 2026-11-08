@@ -17,6 +17,26 @@ export const GROUP = "sim-group";
 export const WORK_GROUP = "sim-work";
 export const DM = "sim-dm";
 
+// A small picture of one colour, as someone might send to the bot.
+// 120 by 90 in one colour, as lossless WebP, made once with @jsquash/webp's encoder.
+export const WEBP_GREEN = Buffer.from("UklGRiQAAABXRUJQVlA4TBcAAAAvd0AWAAdQ5po1s/9hABLC//1SRP9TogA=", "base64");
+export const WEBP_ORANGE = Buffer.from("UklGRiQAAABXRUJQVlA4TBcAAAAvd0AWAAdQszJ3pv9hABLC//1SRP9TogA=", "base64");
+// 64 by 48, lossy, its left half blue and its right half clear: a still picture with an extended
+// header, as some of PigHub's are.
+export const WEBP_EXTENDED = Buffer.from(
+  "UklGRnwAAABXRUJQVlA4WAoAAAAQAAAAPwAALwAAQUxQSBQAAAABDzD/ERFCLJjMXzqFzoj+RxV8B1ZQOCBCAAAAsAMAnQEqQAAwAD4xGItEIiGhEVQAIAMEs4A7AH4AABbwhI+seGAA/vBsr//99APdgvuwX/FD//8/M7txfzmAAAAA",
+  "base64",
+);
+// How an animated WebP starts: an extended header with the animation flag set.
+export const WEBP_ANIMATED = Buffer.concat([Buffer.from("RIFF"), Buffer.from([30, 0, 0, 0]), Buffer.from("WEBPVP8X"), Buffer.from([10, 0, 0, 0, 0x02, 0, 0, 0]), Buffer.alloc(6)]);
+// Says it's WebP, but isn't one.
+export const WEBP_BROKEN = Buffer.concat([Buffer.from("RIFF"), Buffer.alloc(4), Buffer.from("WEBPVP8 "), Buffer.alloc(20)]);
+
+export async function picture(color = 0xff99ccff, mime: "image/png" | "image/jpeg" | "image/gif" = "image/png"): Promise<Buffer> {
+  const { Jimp } = await import("jimp");
+  return Buffer.from(await new Jimp({ width: 120, height: 90, color }).getBuffer(mime));
+}
+
 // Stands in for the model. Each test scripts how it behaves, including misbehaving.
 export class FakeBrain implements Brain {
   readonly model = "fake";

@@ -1,11 +1,29 @@
 import type { Autonomy, ChannelLogin, ChannelStatus, ConversationKind, InboundMessage } from "@shu/protocol";
 
-export type OutboundText = {
+// The bot's own settings, where small pieces of state are kept between runs.
+export type SettingsStore = {
+  getSetting<T>(key: string): T | undefined;
+  setSetting(key: string, value: unknown): void;
+};
+
+export type OutboundTarget = {
   channelId: string;
   conversationId: string;
   conversationKind: ConversationKind;
-  text: string;
   replyToId?: string;
+};
+
+export type OutboundText = OutboundTarget & { text: string };
+
+// A picture the bot drew. One the same every time, such as a die landing on 3, says so with a key,
+// so a platform can upload it once and reuse it.
+export type ChatImage = {
+  data: Buffer;
+  mediaType: "image/png" | "image/jpeg" | "image/gif";
+  width: number;
+  height: number;
+  alt: string;
+  reuseKey?: string;
 };
 
 export type AdapterConversation = {
@@ -19,7 +37,12 @@ export type AdapterConversation = {
 // A file on the platform. Only fetched for the owner: nobody else can make the bot download.
 export type InboundAttachment = { name: string; download(): Promise<Buffer> };
 
-export type AdapterMessage = InboundMessage & { attachments?: InboundAttachment[] };
+// A picture posted in a group, known by its content's MD5, which QQ gives as the file's name. It's
+// only fetched where the owner has asked for a group's pictures to be counted, and only once
+// enough people have posted it.
+export type SeenImage = { fingerprint: string; fetch(): Promise<Buffer> };
+
+export type AdapterMessage = InboundMessage & { attachments?: InboundAttachment[]; seenImages?: SeenImage[] };
 
 export type AdapterHandlers = {
   onMessage(message: AdapterMessage): void;
@@ -45,6 +68,10 @@ export interface Adapter {
   stop(): Promise<void>;
   send(message: OutboundText): Promise<void>;
   sendFile?(conversationId: string, absolutePath: string, fileName: string): Promise<void>;
+  // Pictures in one message, with an optional line of text.
+  sendImages?(target: OutboundTarget, images: ChatImage[], caption?: string): Promise<void>;
+  // A formatted card, written in the platform's Markdown.
+  sendCard?(target: OutboundTarget, markdown: string): Promise<void>;
   beginLogin?(): Promise<void>;
   submitLoginCode?(code: string): void;
   logout?(): Promise<void>;

@@ -160,7 +160,7 @@ export function OverviewPage({ engine, state, onOpenActivity }: { engine: Engine
         <Spending label="群聊" usedUsd={todayUsd} limitUsd={dailyLimitUsd} />
         <Spending label="我的工作" usedUsd={ownerTodayUsd} limitUsd={ownerDailyLimitUsd} />
         <p className="panel-meta">
-          群友搜索 {searchesToday} / {searchLimit} 次
+          群友联网（搜索和读链接） {searchesToday} / {searchLimit} 次
         </p>
       </section>
 

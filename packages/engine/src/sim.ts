@@ -1,7 +1,7 @@
 // A chat platform that exists only inside the console, so every path through the engine
 // can be exercised without touching a real account.
 import type { ChannelLogin, ChannelStatus, SimSender } from "@shu/protocol";
-import type { Adapter, AdapterConversation, AdapterHandlers, OutboundText } from "./types.ts";
+import type { Adapter, AdapterConversation, AdapterHandlers, ChatImage, OutboundTarget, OutboundText } from "./types.ts";
 
 export const SIM_CHANNEL_ID = "sim";
 
@@ -24,6 +24,10 @@ export class SimAdapter implements Adapter {
   readonly personaInOwnerChat = true;
   sent: OutboundText[] = [];
   sentFiles: { conversationId: string; path: string; fileName: string }[] = [];
+  // The console shows these as a line of text; tests look at what was drawn.
+  sentImages: { target: OutboundTarget; images: ChatImage[]; caption?: string }[] = [];
+  sentCards: { target: OutboundTarget; markdown: string }[] = [];
+  failNextImage: Error | null = null;
   // Lets a test make the platform reject a message.
   failNextSend: Error | null = null;
   #handlers: AdapterHandlers | null = null;
@@ -62,5 +66,18 @@ export class SimAdapter implements Adapter {
 
   async sendFile(conversationId: string, path: string, fileName: string) {
     this.sentFiles.push({ conversationId, path, fileName });
+  }
+
+  async sendImages(target: OutboundTarget, images: ChatImage[], caption?: string) {
+    if (this.failNextImage) {
+      const error = this.failNextImage;
+      this.failNextImage = null;
+      throw error;
+    }
+    this.sentImages.push({ target, images, ...(caption ? { caption } : {}) });
+  }
+
+  async sendCard(target: OutboundTarget, markdown: string) {
+    this.sentCards.push({ target, markdown });
   }
 }

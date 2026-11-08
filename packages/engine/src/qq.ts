@@ -1,7 +1,8 @@
 // The official QQ bot platform: a gateway WebSocket for events and HTTP for sending.
 import type { ChannelStatus, ConversationKind } from "@shu/protocol";
 import { describeNetworkError, networkErrorCode } from "./net.ts";
-import type { Adapter, AdapterConversation, AdapterHandlers, AdapterMessage, InboundAttachment, OutboundText } from "./types.ts";
+import { createHash } from "node:crypto";
+import type { Adapter, AdapterConversation, AdapterHandlers, AdapterMessage, ChatImage, InboundAttachment, OutboundTarget, OutboundText, SeenImage, SettingsStore } from "./types.ts";
 
 export const QQ_CHANNEL_ID = "qq";
 
@@ -17,6 +18,8 @@ const MAX_MESSAGE_AGE_MS = 10 * 60_000;
 const MAX_DOWNLOAD_BYTES = 30 * 1024 * 1024;
 const DOWNLOAD_TIMEOUT_MS = 60_000;
 const IMAGE_FILE = /\.(png|jpe?g|gif|webp)$/i;
+// QQ names a picture after its content's MD5: checked against a picture the owner sent.
+const IMAGE_FINGERPRINT = /^([0-9a-f]{32})\.(png|jpe?g|gif|webp)$/i;
 const IMAGE_EXTENSIONS: Record<string, string> = { "image/png": ".png", "image/gif": ".gif", "image/webp": ".webp" };
 
 // How long a message can be replied to, and how many times. Past either, a reply goes
@@ -144,12 +147,16 @@ export class QqAdapter implements Adapter {
   #seen = new Set<string>();
   #replyable = new Map<string, { kind: ConversationKind; receivedAt: number; replies: number }>();
 
-  constructor(options: { appId: string; appSecret: string; apiBase?: string; backoffMs?: number }) {
+  // Keeps uploaded pictures that are the same every time, since the platform holds only so many.
+  #cache: SettingsStore | null;
+
+  constructor(options: { appId: string; appSecret: string; apiBase?: string; backoffMs?: number; cache?: SettingsStore }) {
     this.#appId = options.appId;
     this.#appSecret = options.appSecret;
     this.#api = options.apiBase ?? DEFAULT_API;
     this.#baseBackoffMs = options.backoffMs ?? 1000;
     this.#backoffMs = this.#baseBackoffMs;
+    this.#cache = options.cache ?? null;
   }
 
   conversations(): AdapterConversation[] {
@@ -181,9 +188,86 @@ export class QqAdapter implements Adapter {
   async send(message: OutboundText) {
     const content = prepareContent(message.text);
     if (!content) return;
-    const base = message.conversationKind === "group" ? `/v2/groups/${message.conversationId}/messages` : `/v2/users/${message.conversationId}/messages`;
-    // Every try carries the same msg_seq, so it counts as one reply and can't arrive twice.
-    const passive = this.#passiveFields(message.replyToId);
+    await this.#post(message, { content, msg_type: 0 });
+  }
+
+  // Free-form Markdown, which the platform opened to every bot for groups and private chats.
+  async sendCard(target: OutboundTarget, markdown: string) {
+    const content = prepareContent(markdown);
+    if (!content) return;
+    await this.#post(target, { msg_type: 2, markdown: { content } });
+  }
+
+  // A picture made for this message alone goes up as rich media, which takes PNG and has no cap on
+  // how many. Pictures that are the same every time, and animated ones, go up once as materials,
+  // which take GIF and are shown in a Markdown message; a bot can only keep 100 of those.
+  async sendImages(target: OutboundTarget, images: ChatImage[], caption?: string) {
+    const text = caption ? prepareContent(caption) : "";
+    const [only] = images;
+    if (images.length === 1 && only && !only.reuseKey && only.mediaType === "image/png") {
+      const fileInfo = await this.#uploadMedia(target, only);
+      await this.#post(target, { msg_type: 7, media: { file_info: fileInfo }, content: text || " " });
+      return;
+    }
+    if (images.some((image) => !image.reuseKey)) throw new Error("这张图不能作为素材上传。");
+    const shown: string[] = [];
+    for (const image of images) {
+      const reference = await this.#material(image);
+      shown.push(`![${image.alt.replace(/[[\]]/g, "")} #${image.width}px #${image.height}px](${reference})`);
+    }
+    await this.#post(target, { msg_type: 2, markdown: { content: [shown.join(""), text].filter(Boolean).join("\n\n") } });
+  }
+
+  async #uploadMedia(target: OutboundTarget, image: ChatImage): Promise<string> {
+    const base = target.conversationKind === "group" ? `/v2/groups/${target.conversationId}/files` : `/v2/users/${target.conversationId}/files`;
+    // Uploaded without sending, so the message that shows it can still be a reply.
+    const uploaded = (await this.#request("POST", base, {
+      file_type: 1,
+      file_name: `${image.alt.replace(/[\\/:*?"<>|\s]/g, "") || "image"}.png`,
+      file_data: image.data.toString("base64"),
+      srv_send_msg: false,
+    })) as { file_info?: string } | null;
+    if (!uploaded?.file_info) throw new Error("QQ 没有返回上传的图片。");
+    return uploaded.file_info;
+  }
+
+  // Uploaded once and then reused, for as long as the platform keeps it. Each use extends that.
+  async #material(image: ChatImage): Promise<string> {
+    const key = `qq:material:${image.reuseKey}`;
+    const saved = this.#cache?.getSetting<{ url: string; expiresAt: number; ttlMs: number }>(key);
+    if (saved && saved.expiresAt - Date.now() > 24 * 60 * 60_000) {
+      this.#cache?.setSetting(key, { ...saved, expiresAt: Date.now() + saved.ttlMs });
+      return saved.url;
+    }
+    const md5 = createHash("md5").update(image.data).digest("hex");
+    const prepared = (await this.#request("POST", "/v2/media-images/prepare", {
+      // The platform wants the extension to match the declared type.
+      file_name: `${image.reuseKey}.${{ "image/gif": "gif", "image/jpeg": "jpg", "image/png": "png" }[image.mediaType]}`,
+      file_size: image.data.length,
+      content_type: image.mediaType,
+      md5,
+      sha1: createHash("sha1").update(image.data).digest("hex"),
+    })) as { upload_id?: string; presigned_url?: string } | null;
+    if (!prepared?.upload_id || !prepared.presigned_url) throw new Error("QQ 没有给出上传地址。");
+    const put = await fetch(prepared.presigned_url, {
+      method: "PUT",
+      headers: { "Content-Type": image.mediaType },
+      body: new Uint8Array(image.data),
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS * 2),
+    });
+    if (!put.ok) throw new Error(`QQ 图片上传失败（HTTP ${put.status}）`);
+    const etag = put.headers.get("etag")?.replace(/"/g, "") || md5;
+    const completed = (await this.#request("POST", "/v2/media-images/complete", { upload_id: prepared.upload_id, md5: etag })) as { url?: string; ttl?: number } | null;
+    if (!completed?.url) throw new Error("QQ 没有返回素材地址。");
+    const ttlMs = (completed.ttl ?? 90 * 24 * 60 * 60) * 1000;
+    this.#cache?.setSetting(key, { url: completed.url, expiresAt: Date.now() + ttlMs, ttlMs });
+    return completed.url;
+  }
+
+  // Every try carries the same msg_seq, so it counts as one reply and can't arrive twice.
+  async #post(target: OutboundTarget, body: Record<string, unknown>) {
+    const base = target.conversationKind === "group" ? `/v2/groups/${target.conversationId}/messages` : `/v2/users/${target.conversationId}/messages`;
+    const passive = this.#passiveFields(target.replyToId);
     const isReply = "msg_id" in passive;
 
     let lastError: unknown;
@@ -194,7 +278,7 @@ export class QqAdapter implements Adapter {
         if (this.#stopped) break;
       }
       try {
-        await this.#request("POST", base, { content, msg_type: 0, ...passive });
+        await this.#request("POST", base, { ...body, ...passive });
         return;
       } catch (error) {
         // An earlier try got through after all, and only its answer was lost.
@@ -320,6 +404,7 @@ export class QqAdapter implements Adapter {
     if (author.bot || (this.#self.id && senderId === this.#self.id)) return;
 
     this.#remember(message.id, "group");
+    const seenImages = this.#seenImages(message);
     this.#deliver({
       id: message.id,
       channelId: this.id,
@@ -331,6 +416,17 @@ export class QqAdapter implements Adapter {
       text: this.#cleanText(message),
       mentionsBot: alwaysMentioned || (message.mentions ?? []).some((user) => this.#isSelf(user)),
       at: Date.now(),
+      ...(seenImages.length ? { seenImages } : {}),
+    });
+  }
+
+  // Pictures in a group message, by fingerprint, with the link kept for fetching later. The link
+  // isn't followed here.
+  #seenImages(message: QqMessage): SeenImage[] {
+    return (message.attachments ?? []).flatMap((file) => {
+      const fingerprint = IMAGE_FINGERPRINT.exec(file.filename ?? "")?.[1];
+      const url = attachmentUrl(file.url);
+      return isImage(file) && fingerprint && url ? [{ fingerprint: fingerprint.toUpperCase(), fetch: () => this.#download(url) }] : [];
     });
   }
 

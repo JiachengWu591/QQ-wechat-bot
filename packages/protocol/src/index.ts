@@ -55,6 +55,9 @@ export type ChatLine = {
   // For an outgoing line, the authority its turn ran with: what the bot wrote can carry
   // whatever was in its context, so it never counts as more trusted than that.
   tier: Tier;
+  // For a reply, the tools its turn used. The model only sees its earlier replies' words, and
+  // without this it took ones that rolled dice or read a page for made up.
+  tools?: string[];
 };
 
 export type ActivityLevel = "info" | "ok" | "blocked" | "error";

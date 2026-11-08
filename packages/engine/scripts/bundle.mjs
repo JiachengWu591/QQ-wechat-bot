@@ -4,6 +4,7 @@
 import { build } from "esbuild";
 import { spawnSync } from "node:child_process";
 import { copyFileSync, mkdirSync, rmSync } from "node:fs";
+import { createRequire } from "node:module";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -29,6 +30,10 @@ rmSync(out, { recursive: true, force: true });
 mkdirSync(out, { recursive: true });
 await build({ ...options, entryPoints: [join(source, "main.ts")], outfile: join(out, "engine.mjs") });
 for (const script of ["wx-common.ps1", "wx-helper.ps1", "wx-send.ps1"]) copyFileSync(join(source, script), join(out, script));
+// The renderer for the pictures the bot draws, which render.ts looks for beside the bundle.
+copyFileSync(createRequire(import.meta.url).resolve("@resvg/resvg-wasm/index_bg.wasm"), join(out, "resvg.wasm"));
+// The WebP decoder, which webp.ts looks for beside the bundle.
+copyFileSync(createRequire(import.meta.url).resolve("@jsquash/webp/codec/dec/webp_dec.wasm"), join(out, "webp_dec.wasm"));
 copyFileSync(process.execPath, join(out, "node.exe"));
 console.log(`engine bundled into ${out} with Node ${process.versions.node}`);
 

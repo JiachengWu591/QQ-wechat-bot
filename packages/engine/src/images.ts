@@ -25,7 +25,7 @@ export async function prepareImage(data: Buffer): Promise<{ parts: ImagePart[]; 
   const mediaType = sniffImage(data);
   if (!mediaType) throw new Error("认不出这种图片格式。");
 
-  // The library can't decode these, and neither format is how phones save screenshots.
+  // Neither is how phones save screenshots, and the library can't decode WebP.
   if (mediaType === "image/gif" || mediaType === "image/webp") {
     if (data.length > MAX_BYTES) throw new Error("图片太大，读不了。");
     return { parts: [{ mediaType, data }] };

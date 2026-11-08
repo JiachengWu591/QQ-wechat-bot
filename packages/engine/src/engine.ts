@@ -36,11 +36,13 @@ import type {
 } from "@shu/protocol";
 import type { Brain, ToolOutcome } from "./brain.ts";
 import { atLeast, effectiveTier, RateLimiter, tierOf, type AccessList } from "./policy.ts";
+import { conversationNicknames } from "./fun.ts";
+import { CANDIDATE_MIN_SENDERS, collectSeen, collectsIn, type GroupChoice } from "./pool.ts";
 import { chatPrompt, systemPrompt } from "./prompt.ts";
 import { SIM_CHANNEL_ID } from "./sim.ts";
 import type { BudgetLane, Store } from "./store.ts";
 import { noInput, type LocalTool, type ToolContext } from "./tools.ts";
-import type { Adapter, AdapterConversation, AdapterMessage } from "./types.ts";
+import type { Adapter, AdapterConversation, AdapterMessage, ChatImage } from "./types.ts";
 import { confusableGroup, normalizeGroupName, Workbench, type ChatReading, type WorkbenchMention } from "./workbench.ts";
 import type { Workspace } from "./workspace.ts";
 import {
@@ -98,6 +100,9 @@ const PAIRING_TTL_MS = 10 * 60_000;
 const MAX_PAIRING_FAILURES = 5;
 const SEARCHES_PER_CHAT_CALL = 3;
 const SEARCHES_PER_TASK_CALL = 8;
+const FETCHES_PER_CALL = 3;
+// A link someone typed, with or without the scheme. Pages are only fetched when there is one.
+const LINK_IN_TEXT = /\bhttps?:\/\/\S+|\bwww\.\S+|\b[a-z0-9-]+(?:\.[a-z0-9-]+)*\.(?:com|cn|net|org|io|ai|dev|app|co|gov|edu|top|xyz|info|me|tv)(?:\/\S*)?/i;
 const DAY_MS = 24 * 60 * 60_000;
 const CANCEL_WORDS = new Set(["/cancel", "/stop", "取消", "停止"]);
 
@@ -108,12 +113,16 @@ type Turn = {
   adapter: Adapter;
   title: string;
   tier: Tier;
+  // Pictures and cards go out at once, so only where replies don't wait for the owner.
+  autonomy: Autonomy;
   canSendFiles: boolean;
   lane: BudgetLane;
   limitUsd: number;
   today: string;
   controller: AbortController;
   stoppedByBudget: boolean;
+  // The tools that ran, kept with the reply so later turns can see it wasn't made up.
+  toolsUsed: Set<string>;
   // Tells the owner a slow task is under way, unless there's already something to show for it.
   ack: ReturnType<typeof setTimeout> | undefined;
 };
@@ -675,6 +684,10 @@ export class Engine extends EventEmitter<EngineEvents> {
     };
     this.#store.addMessage(line);
     this.emit("chat", line);
+    // Counted whether or not the bot was addressed, and only where the owner asked.
+    if (conversation.kind === "group" && message.seenImages?.length && collectsIn(this.#store, message.channelId, conversation.id)) {
+      void this.#collectPictures(message, conversation, title);
+    }
 
     if (conversation.kind === "group" && !this.#addressesBot(message, adapter)) return;
 
@@ -875,6 +888,7 @@ export class Engine extends EventEmitter<EngineEvents> {
       adapter,
       title,
       tier,
+      autonomy,
       // A held reply needs the owner's approval, and a sent file can't be taken back.
       canSendFiles: Boolean(adapter.sendFile) && autonomy === "auto",
       lane,
@@ -882,6 +896,7 @@ export class Engine extends EventEmitter<EngineEvents> {
       today,
       controller,
       stoppedByBudget: false,
+      toolsUsed: new Set(),
       ack:
         isWork && autonomy === "auto"
           ? setTimeout(() => void this.#notify(conversation, trigger.channelId, "正在处理，完成后发给你。发“取消”可以停止。", tier, trigger.id), this.#config.taskAckMs)
@@ -889,6 +904,8 @@ export class Engine extends EventEmitter<EngineEvents> {
     };
     const offered = this.#tools.filter((tool) => atLeast(tier, tool.minTier) && (!tool.needsSendFile || turn.canSendFiles));
     const persona = this.#personaFor(trigger.channelId, isWork && !adapter.personaInOwnerChat);
+    const webFetchUses = LINK_IN_TEXT.test(trigger.text) ? this.#fetchAllowance(isOwner || isWork, today) : 0;
+    const nicknames = conversationNicknames(this.#store, trigger.channelId, conversation.id);
 
     this.#inFlight.set(controller, `${trigger.channelId}:${trigger.conversationId}`);
     try {
@@ -896,10 +913,11 @@ export class Engine extends EventEmitter<EngineEvents> {
         model: this.#selectedModel() ?? this.#brain.model,
         system: systemPrompt(botName, adapter.promptHint, isWork, persona),
         ...(persona ? { cacheSystem: true } : {}),
-        prompt: chatPrompt({ conversationTitle: title, kind: conversation.kind, history, current: trigger }),
+        prompt: chatPrompt({ conversationTitle: title, kind: conversation.kind, history, current: trigger, nicknames, canReadLinks: webFetchUses > 0 }),
         tools: offered.map(({ name, description, inputSchema }) => ({ name, description, inputSchema })),
         profile: isWork ? "task" : "chat",
         webSearchUses: this.#searchAllowance(isOwner, isWork, today),
+        webFetchUses,
         signal: controller.signal,
         onCost: (costUsd) => {
           this.#store.addCost(today, costUsd, lane);
@@ -907,7 +925,9 @@ export class Engine extends EventEmitter<EngineEvents> {
         },
         runTool: (name, input) => this.#runTool(name, input, turn),
       });
-      if (!isOwner && result.webSearches > 0) this.#store.setSetting(`searches:${today}`, this.#sharedSearches(today) + result.webSearches);
+      // Searching and reading pages share the daily allowance for everyone but the owner.
+      const lookups = result.webSearches + (result.webFetches ?? 0);
+      if (!isOwner && lookups > 0) this.#store.setSetting(`searches:${today}`, this.#sharedSearches(today) + lookups);
 
       if (controller.signal.aborted) return await this.#turnStopped(turn);
       if (result.refused) this.#log("blocked", "模型拒绝回复这条消息", title);
@@ -920,7 +940,9 @@ export class Engine extends EventEmitter<EngineEvents> {
         this.#log("info", `写好了给 ${trigger.senderName} 的回复，等你确认`, title, result.costUsd);
       } else {
         try {
-          await this.#deliver(conversation, trigger.channelId, text, tier, trigger.id, result.costUsd);
+          if (result.webSearches > 0) turn.toolsUsed.add("web_search");
+          if (result.webFetches) turn.toolsUsed.add("web_fetch");
+          await this.#deliver(conversation, trigger.channelId, text, tier, trigger.id, result.costUsd, [...turn.toolsUsed]);
         } catch (error) {
           if (!isWork) throw error;
           // The work is done and paid for, so a failed send mustn't throw it away.
@@ -988,14 +1010,25 @@ export class Engine extends EventEmitter<EngineEvents> {
     }
     const context: ToolContext = {
       signal: controller.signal,
+      caller: {
+        channelId: turn.trigger.channelId,
+        conversationId: turn.conversation.id,
+        conversationKind: turn.conversation.kind,
+        senderId: turn.trigger.senderId,
+        senderName: turn.trigger.senderName,
+        senderTier: turn.trigger.tier,
+      },
       onCost: (costUsd) => {
         this.#store.addCost(turn.today, costUsd, turn.lane);
         this.#emitState();
       },
       ...(turn.canSendFiles ? { sendFile: (path: string, fileName: string) => this.#deliverFile(turn, path, fileName) } : {}),
+      ...(turn.autonomy === "auto" && turn.adapter.sendImages ? { sendImages: (images: ChatImage[], caption?: string) => this.#deliverImages(turn, images, caption) } : {}),
+      ...(turn.autonomy === "auto" && turn.adapter.sendCard ? { sendCard: (markdown: string) => this.#deliverCard(turn, markdown) } : {}),
     };
     try {
       const content = await tool.run(input, context);
+      turn.toolsUsed.add(name);
       this.#log("ok", `调用了工具 ${name}`, title);
       return { content, isError: false };
     } catch (error) {
@@ -1014,6 +1047,54 @@ export class Engine extends EventEmitter<EngineEvents> {
     this.#log("ok", `已发送文件：${fileName}`, title);
   }
 
+  // Never takes the message down with it: a picture that can't be fetched is only logged.
+  async #collectPictures(message: AdapterMessage, conversation: AdapterConversation, title: string) {
+    for (const image of message.seenImages ?? []) {
+      try {
+        const kept = await collectSeen(this.#store, this.#workspace, { channelId: message.channelId, conversationId: conversation.id, senderId: message.senderId, at: message.at }, image);
+        if (kept) this.#log("info", `有一张图被至少 ${CANDIDATE_MIN_SENDERS} 个人发过，存成了猪猪候选`, title);
+      } catch (error) {
+        this.#log("error", `候选图没存下来：${error instanceof Error ? error.message : String(error)}`, title);
+      }
+    }
+  }
+
+  // The groups the bot knows, by the name shown in the console.
+  groupConversations(): GroupChoice[] {
+    return [...this.#adapters.values()].flatMap((adapter) =>
+      this.#knownConversations(adapter.id)
+        .filter((conversation) => conversation.kind === "group")
+        .map((conversation) => ({ channelId: adapter.id, conversationId: conversation.id, title: this.#titleOf(adapter.id, conversation) })),
+    );
+  }
+
+  // A failure is logged here and passed on, so the tool can fall back to saying it in words.
+  async #deliverImages(turn: Turn, images: ChatImage[], caption?: string) {
+    const { conversation, adapter, trigger, tier, title } = turn;
+    if (turn.controller.signal.aborted || !this.#canSend(trigger.channelId, conversation.id)) throw new Error("已关闭，图片没有发送。");
+    clearTimeout(turn.ack);
+    try {
+      await adapter.sendImages?.({ channelId: trigger.channelId, conversationId: conversation.id, conversationKind: conversation.kind, replyToId: trigger.id }, images, caption);
+    } catch (error) {
+      this.#log("error", `图片发送失败：${error instanceof Error ? error.message : String(error)}`, title);
+      throw error;
+    }
+    this.#recordOutgoing(trigger.channelId, conversation.id, adapter, [`[图片] ${images.map((image) => image.alt).join("、")}`, caption].filter(Boolean).join(" "), tier);
+  }
+
+  async #deliverCard(turn: Turn, markdown: string) {
+    const { conversation, adapter, trigger, tier, title } = turn;
+    if (turn.controller.signal.aborted || !this.#canSend(trigger.channelId, conversation.id)) throw new Error("已关闭，卡片没有发送。");
+    clearTimeout(turn.ack);
+    try {
+      await adapter.sendCard?.({ channelId: trigger.channelId, conversationId: conversation.id, conversationKind: conversation.kind, replyToId: trigger.id }, markdown);
+    } catch (error) {
+      this.#log("error", `卡片发送失败：${error instanceof Error ? error.message : String(error)}`, title);
+      throw error;
+    }
+    this.#recordOutgoing(trigger.channelId, conversation.id, adapter, `[卡片] ${markdown.replace(/[#*>_~]/g, "").replace(/\s+/g, " ").trim().slice(0, 200)}`, tier);
+  }
+
   // For things the bot says about the work itself, which must never take a turn down with them.
   async #notify(conversation: AdapterConversation, channelId: string, text: string, tier: Tier, replyToId: string) {
     await this.#deliver(conversation, channelId, text, tier, replyToId).catch((error: unknown) => {
@@ -1030,6 +1111,13 @@ export class Engine extends EventEmitter<EngineEvents> {
     return Math.max(0, Math.min(SEARCHES_PER_CHAT_CALL, left));
   }
 
+  // Reading a page someone linked to. Off along with search, and shares its daily allowance.
+  #fetchAllowance(unlimited: boolean, today: string): number {
+    if (!this.#config.webSearch) return 0;
+    if (unlimited) return FETCHES_PER_CALL;
+    return Math.max(0, Math.min(FETCHES_PER_CALL, this.#config.sharedSearchesPerDay - this.#sharedSearches(today)));
+  }
+
   #sharedSearches(today: string): number {
     return this.#store.getSetting<number>(`searches:${today}`) ?? 0;
   }
@@ -1040,18 +1128,18 @@ export class Engine extends EventEmitter<EngineEvents> {
     return this.#settings(channelId, this.#conversationFor(channelId, conversationId)).enabled;
   }
 
-  async #deliver(conversation: AdapterConversation, channelId: string, text: string, tier: Tier, replyToId: string, costUsd?: number) {
+  async #deliver(conversation: AdapterConversation, channelId: string, text: string, tier: Tier, replyToId: string, costUsd?: number, tools: string[] = []) {
     const title = this.#titleOf(channelId, conversation);
     if (!this.#canSend(channelId, conversation.id)) {
       return this.#log("blocked", "已关闭，这条回复没有发送", title);
     }
     const adapter = this.#adapterFor(channelId);
     await adapter.send({ channelId, conversationId: conversation.id, conversationKind: conversation.kind, text, replyToId });
-    this.#recordOutgoing(channelId, conversation.id, adapter, text, tier);
+    this.#recordOutgoing(channelId, conversation.id, adapter, text, tier, tools);
     this.#log("ok", `已回复：${preview(text)}`, title, costUsd);
   }
 
-  #recordOutgoing(channelId: string, conversationId: string, adapter: Adapter, text: string, tier: Tier) {
+  #recordOutgoing(channelId: string, conversationId: string, adapter: Adapter, text: string, tier: Tier, tools: string[] = []) {
     const line: ChatLine = {
       id: randomUUID(),
       channelId,
@@ -1062,6 +1150,7 @@ export class Engine extends EventEmitter<EngineEvents> {
       text,
       at: this.#now(),
       tier,
+      ...(tools.length ? { tools } : {}),
     };
     this.#store.addMessage(line);
     this.emit("chat", line);
